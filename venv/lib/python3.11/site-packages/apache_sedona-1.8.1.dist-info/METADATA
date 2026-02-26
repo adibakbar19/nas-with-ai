@@ -1,0 +1,67 @@
+Metadata-Version: 2.4
+Name: apache-sedona
+Version: 1.8.1
+Summary: Apache Sedona is a cluster computing system for processing large-scale spatial data
+Author-email: Apache Sedona <dev@sedona.apache.org>
+License: Apache-2.0
+Project-URL: HomePage, https://sedona.apache.org
+Project-URL: Documentation, https://sedona.apache.org
+Project-URL: Source code, https://github.com/apache/sedona
+Project-URL: Bug Reports, https://issues.apache.org/jira/projects/SEDONA
+Classifier: Programming Language :: Python :: 3
+Classifier: License :: OSI Approved :: Apache Software License
+Requires-Python: >=3.8
+Description-Content-Type: text/markdown
+Requires-Dist: attrs
+Requires-Dist: shapely>=1.7.0
+Provides-Extra: spark
+Requires-Dist: pyspark<4.1.0,>=3.4.0; extra == "spark"
+Provides-Extra: pydeck-map
+Requires-Dist: geopandas; extra == "pydeck-map"
+Requires-Dist: pydeck==0.8.0; extra == "pydeck-map"
+Provides-Extra: kepler-map
+Requires-Dist: geopandas; extra == "kepler-map"
+Requires-Dist: keplergl==0.3.2; extra == "kepler-map"
+Provides-Extra: flink
+Requires-Dist: apache-flink>=1.19.0; extra == "flink"
+Provides-Extra: db
+Requires-Dist: sedonadb[geopandas]; python_version >= "3.9" and extra == "db"
+Provides-Extra: all
+Requires-Dist: pyspark<4.1.0,>=3.4.0; extra == "all"
+Requires-Dist: geopandas; extra == "all"
+Requires-Dist: pydeck==0.8.0; extra == "all"
+Requires-Dist: keplergl==0.3.2; extra == "all"
+Requires-Dist: rasterio>=1.2.10; extra == "all"
+
+<!--
+ Licensed to the Apache Software Foundation (ASF) under one
+ or more contributor license agreements.  See the NOTICE file
+ distributed with this work for additional information
+ regarding copyright ownership.  The ASF licenses this file
+ to you under the Apache License, Version 2.0 (the
+ "License"); you may not use this file except in compliance
+ with the License.  You may obtain a copy of the License at
+
+   http://www.apache.org/licenses/LICENSE-2.0
+
+ Unless required by applicable law or agreed to in writing,
+ software distributed under the License is distributed on an
+ "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ KIND, either express or implied.  See the License for the
+ specific language governing permissions and limitations
+ under the License.
+ -->
+
+# Apache Sedona
+
+<img alt="" referrerpolicy="no-referrer-when-downgrade" src="https://static.scarf.sh/a.png?x-pxid=acc24e73-991b-4e92-8a6d-e33f333a645d" />
+
+This library is the Python wrapper for Apache Sedona.
+
+Apache Sedona is a cluster computing system for processing large-scale spatial data.
+Apache Sedona extends Apache Spark / SparkSQL with a set of out-of-the-box Spatial Resilient Distributed Datasets (SRDDs)/ SpatialSQL that efficiently load, process, and analyze large-scale spatial data across machines.
+
+Please visit the official Apache Sedona website:
+https://sedona.apache.org/
+
+Development environment setup docs: https://sedona.apache.org/latest-snapshot/setup/compile/#run-python-test
