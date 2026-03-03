@@ -19,16 +19,27 @@ FAST_SAMPLE_ROWS="${FAST_SAMPLE_ROWS:-0}"
 if [ "${FAST_MODE}" = "1" ]; then
   SKIP_LLM="${SKIP_LLM:-1}"
   SKIP_LOAD="${SKIP_LOAD:-1}"
-  PIPELINE_CONFIG="${PIPELINE_CONFIG:-config/config.fast.json}"
+  SKIP_ES="${SKIP_ES:-1}"
+  PIPELINE_CONFIG="${PIPELINE_CONFIG:-config/config.json}"
   PIPELINE_SUCCESS="${PIPELINE_SUCCESS:-output/cleaned-fast}"
   PIPELINE_FAILED="${PIPELINE_FAILED:-output/failed-fast}"
-  echo "FAST_MODE enabled: using lighter pipeline profile."
+  echo "FAST_MODE enabled: using config/config.json with lighter runtime flags."
 else
   SKIP_LLM="${SKIP_LLM:-0}"
   SKIP_LOAD="${SKIP_LOAD:-0}"
+  SKIP_ES="${SKIP_ES:-1}"
   PIPELINE_CONFIG="${PIPELINE_CONFIG:-config/config.json}"
   PIPELINE_SUCCESS="${PIPELINE_SUCCESS:-output/cleaned}"
   PIPELINE_FAILED="${PIPELINE_FAILED:-output/failed}"
+fi
+
+if [ "${SKIP_ENV_CHECK:-0}" != "1" ]; then
+  echo "Validating required environment variables..."
+  venv/bin/python validate_env.py \
+    --target run_all \
+    --skip-load "${SKIP_LOAD}" \
+    --skip-es "${SKIP_ES}" \
+    --skip-llm "${SKIP_LLM}"
 fi
 
 if [ -n "${PIPELINE_INPUT:-}" ]; then
@@ -137,9 +148,16 @@ fi
 
 if [ "${SKIP_LOAD}" != "1" ]; then
   echo "Starting Postgres with docker compose..."
-  docker compose up -d
+  docker compose up -d postgres
 else
   echo "Skipping Postgres startup (SKIP_LOAD=${SKIP_LOAD})."
+fi
+
+if [ "${SKIP_ES}" != "1" ]; then
+  echo "Starting Elasticsearch with docker compose profile 'search'..."
+  docker compose --profile search up -d elasticsearch
+else
+  echo "Skipping Elasticsearch startup (SKIP_ES=${SKIP_ES})."
 fi
 
 echo "Running Spark pipeline (${SOURCE_TYPE}) from ${INPUT_PATH}..."
@@ -205,6 +223,27 @@ if [ "${SKIP_LOAD}" != "1" ]; then
     --pbt-dir "data/Sempadan Kawalan PBT"
 else
   echo "Skipping Postgres load (SKIP_LOAD=${SKIP_LOAD})."
+fi
+
+if [ "${SKIP_ES}" != "1" ]; then
+  echo "Loading cleaned data into Elasticsearch..."
+  ES_INPUT="${ES_INPUT:-${PIPELINE_SUCCESS}}"
+  ES_URL="${ES_URL:-http://localhost:9200}"
+  ES_INDEX="${ES_INDEX:-nas_addresses}"
+  ES_BATCH_SIZE="${ES_BATCH_SIZE:-1000}"
+  ES_RECREATE_INDEX="${ES_RECREATE_INDEX:-1}"
+  ES_ARGS=(
+    --input "${ES_INPUT}"
+    --es-url "${ES_URL}"
+    --index "${ES_INDEX}"
+    --batch-size "${ES_BATCH_SIZE}"
+  )
+  if [ "${ES_RECREATE_INDEX}" = "1" ]; then
+    ES_ARGS+=(--recreate-index)
+  fi
+  venv/bin/python load_elasticsearch.py "${ES_ARGS[@]}"
+else
+  echo "Skipping Elasticsearch load (SKIP_ES=${SKIP_ES})."
 fi
 
 echo "Done."

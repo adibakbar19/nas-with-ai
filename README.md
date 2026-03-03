@@ -4,14 +4,27 @@ Raw Address Dump -> Clean -> Save as Parquet using Spark, with Malaysian lookup 
 
 Quick runbook: see `docs/RUN_PIPELINE.md`.
 
+## Directory Layout
+```text
+etl/        core data pipeline package
+backend/    FastAPI backend
+frontend/   legacy static UI
+frontend-vue/ Vue 3 app (separate deploy)
+config/     pipeline configs
+data/       inputs, lookups, boundaries
+docs/       operational runbooks
+docker/     database bootstrap SQL
+```
+
 ## Workflow
 ```mermaid
 flowchart TD
 
 %% -------- Orchestration --------
 subgraph RUN[run_all.sh Orchestration]
-R0[Load .env and SPARK_JARS_PACKAGES] --> R1[docker compose up -d]
-R1 --> R2[Run pipeline.py]
+R0[Load .env and SPARK_JARS_PACKAGES] --> R1[Start postgres optional]
+R1 --> R1B[Start elasticsearch optional]
+R1B --> R2[Run pipeline.py]
 R2 --> R3{OPENAI_API_KEY set?}
 R3 -->|Yes| R4[Run llm_enrich.py]
 R4 --> R5{data/llm_corrections.csv exists?}
@@ -19,9 +32,10 @@ R5 -->|Yes| R6[Run retry_failed.py]
 R5 -->|No| R7[Skip retry branch]
 R3 -->|No| R7
 R6 --> R7A[Retry outputs written]
-R7A --> R8[Run load_postgres.py --input output/cleaned --normalized]
+R7A --> R8[Run load_postgres.py optional]
 R7 --> R8
-R8 --> R9[Done]
+R8 --> R8B[Run load_elasticsearch.py optional]
+R8B --> R9[Done]
 end
 
 %% -------- Main ETL --------
@@ -129,23 +143,29 @@ Flow notes:
 - `naskod` is written into parquet outputs as a column (`output/cleaned`, `output/failed`, and retry outputs).
 - In Postgres normalized load, official codes are stored in `nas.naskod` table (not as a `naskod` column in `nas.standardized_address`).
 - `run_all.sh` loads `output/cleaned` by default; loading `output/cleaned-llm` is a separate manual step.
+- Elasticsearch loading is optional and controlled by `SKIP_ES` in `run_all.sh`.
 
 ## Files
-- `extract.py`: reads a CSV into a Spark DataFrame.
-- `address_parse.py`: parses a full address string into fields (premise, street, locality, postcode) and prepares normalized segments for matching.
-- `lookup_match.py`: exact + fuzzy matching against state, district, and mukim lookups.
-- `transform.py`: orchestrates parsing + lookup matching.
-- `load.py`: writes Parquet.
-- `pipeline.py`: orchestrates the full ETL flow.
-- `sedona_utils.py`: Sedona registration and Spark config helpers.
-- `audit_log.py`: shared JSONL audit logger.
-- `naskod_utils.py`: reusable NASKod generator for parquet outputs.
-- `load_postgres.py`: loads cleaned Parquet into Postgres/PostGIS.
+- `etl/`: core ETL package (`extract`, `transform`, `pipeline`, loaders, lookup matching, audit helpers).
+- `pipeline.py`: thin entrypoint wrapper to `etl.pipeline`.
+- `load_postgres.py`: thin entrypoint wrapper to `etl.load_postgres`.
+- `load_elasticsearch.py`: thin entrypoint wrapper to `etl.load_elasticsearch`.
+- `search_elasticsearch.py`: thin entrypoint wrapper to `etl.search_elasticsearch`.
+- `llm_enrich.py`: thin entrypoint wrapper to `etl.llm_enrich`.
+- `retry_failed.py`: thin entrypoint wrapper to `etl.retry_failed`.
+- `validate_env.py`: thin entrypoint wrapper to `etl.validate_env`.
+- `backend/app/main.py`: FastAPI backend (`/api/v1/health`, `/api/v1/search/autocomplete`, `/api/v1/jobs`).
+- `backend/app/services/address_service.py`: business logic layer.
+- `backend/app/repositories/address_repository.py`: PostgreSQL/PostGIS repository layer.
+- `backend/app/search/elasticsearch_gateway.py`: Elasticsearch integration layer.
+- `backend/app/queue/producer.py`: async queue producer abstraction + SQS/log implementations.
+- `backend/app/workers/queue_consumer.py`: async worker consumer example.
+- `frontend/`: legacy static UI.
+- `frontend-vue/`: standalone Vue 3 UI for separate bucket/CDN deployment.
 - `run_all.sh`: one-step script to run pipeline + load.
-- `llm_enrich.py`: uses OpenAI to normalize low-confidence/failed addresses.
-- `docker-compose.yml`: PostGIS container definition.
-- `.env`: Postgres credentials used by Docker and loaders.
-- `config/config.fast.json`: lightweight config for `FAST_MODE` runs.
+- `docker-compose.yml`: PostGIS + optional Elasticsearch (`search`) + MinIO (`objectstore`) profiles.
+- `.env`: runtime config used by Docker, backend, and loaders (a template is in `.env.example`).
+- `config/config.json`: main pipeline config (column aliases, boundary/locality matching, replacements).
 
 ## Usage
 
@@ -208,13 +228,97 @@ python pipeline.py \
 ## PostGIS (Docker Compose)
 Start PostGIS:
 ```bash
-docker compose up -d
+docker compose up -d postgres
 ```
 
 If you need to recreate the database:
 ```bash
 docker compose down -v
-docker compose up -d
+docker compose up -d postgres
+```
+
+## Elasticsearch (Optional)
+Start Elasticsearch:
+```bash
+docker compose --profile search up -d elasticsearch
+```
+
+Index cleaned output:
+```bash
+venv/bin/python load_elasticsearch.py \
+  --input output/cleaned \
+  --es-url http://localhost:9200 \
+  --index nas_addresses \
+  --recreate-index
+```
+
+Autocomplete query:
+```bash
+venv/bin/python search_elasticsearch.py \
+  --q "jalan perdana johor" \
+  --index nas_addresses \
+  --size 10
+```
+
+## MinIO (Upload Object Store)
+Start MinIO:
+```bash
+docker compose --profile objectstore up -d minio
+```
+
+Default endpoints:
+- API: `http://localhost:9000`
+- Console: `http://localhost:9001`
+- Credentials are read from `.env` (`MINIO_ACCESS_KEY` / `MINIO_SECRET_KEY`).
+
+## Backend API
+Run API server:
+```bash
+uvicorn backend.app.main:app --host 0.0.0.0 --port 8000 --reload
+```
+Backend checks required env vars at startup. Disable only for local troubleshooting:
+```bash
+STRICT_ENV_CHECK=false uvicorn backend.app.main:app --host 0.0.0.0 --port 8000 --reload
+```
+
+Run worker (required when `INGEST_EXECUTION_MODE=queue_worker`):
+```bash
+python -m backend.app.workers.queue_consumer
+```
+
+Vue frontend (separate):
+```bash
+cd frontend-vue
+npm install
+npm run dev
+```
+Open UI:
+- `http://localhost:5173/`
+- Deployment guide: `frontend-vue/README.md`
+
+Available API endpoints:
+- `GET /api/v1/health`
+- `GET /api/v1/search/autocomplete?q=jalan%20perdana&size=10`
+- `GET /api/v1/jobs?limit=20`
+- `GET /api/v1/jobs/{run_id}`
+- `POST /api/v1/ingest/upload` (multipart file upload to MinIO + optional processing)
+- `GET /api/v1/ingest/jobs?limit=20`
+- `GET /api/v1/ingest/jobs/{job_id}`
+- `POST /api/v1/ingest/jobs/{job_id}/start`
+- `POST /api/v1/ingest/jobs/{job_id}/pause`
+
+Upload + process flow:
+1. Frontend uploads file to backend.
+2. Backend stores file in MinIO bucket (`nas-uploads`).
+3. Backend queues ingest event (`QUEUE_BACKEND=log|sqs`).
+4. Worker consumes event and runs `pipeline.py` (and optional DB load).
+5. Job output written to `output/uploads/<job_id>/cleaned|failed`.
+6. Job log written to `logs/jobs/<job_id>.log`.
+
+Dockerized API + worker:
+```bash
+docker compose --profile api up -d api
+docker compose --profile worker up -d worker
 ```
 
 ## Transform + Validate Behavior
@@ -224,9 +328,10 @@ The transform step expects a **full address string** in one column and performs:
 - If a new address column exists (`new_address`, `alamat_baru`, `address_new`), it is used for parsing, while the old address is retained.
 - Parses `premise_no`, `lot_no`, `unit_no`, `floor_no`, `street_name`, `locality_name`, and `postcode`.
 - Enriches locality/state from `postcodes.csv` when postcode is present.
+- If coordinates exist and postcode boundary shapefiles are configured, resolves postcode zone by point-in-polygon and flags postcode boundary conflicts.
 - Matches `state` exactly (substring).
 - Matches `district` and `mukim` with fuzzy matching, constrained by the matched state and district.
-- If coordinates exist and boundary shapefiles are configured, assigns/overrides `state/district/mukim` using spatial intersection (authoritative boundary layer).
+- If coordinates exist and boundary shapefiles are configured, resolves `state/district/mukim` via spatial intersection and enforces alignment (conflicts are flagged and failed).
 - Builds `top_3_candidates` for mukim using state/district-scoped candidate ranking, and can infer missing district/mukim when top candidate is strong.
 - When coordinates exist, assigns `pbt_id` and `pbt_name` via Sedona spatial join using PBT shapefiles.
 
@@ -236,6 +341,7 @@ Fuzzy matching uses Levenshtein distance with thresholds:
 
 Validation splits data into success/failed:
 - Missing or invalid postcode
+- Postcode/admin conflicts against boundary layers
 - Missing state/district (and optionally mukim)
 - Invalid state/district/mukim against lookup tables
 - Low confidence (`confidence_score < 75`)
@@ -292,6 +398,12 @@ Use a JSON config to customize which columns are treated as old/new addresses an
   "pbt_simplify_tolerance": 0.00005,
   "admin_boundary_enabled": true,
   "state_boundary_dir": "data/boundary/01_State_boundary",
+  "postcode_boundary_enabled": true,
+  "postcode_boundary_dir": "data/boundary/02_Postcode_boundary",
+  "postcode_boundary_postcode_column": "POSTCODE",
+  "postcode_boundary_city_column": "TOWN_CITY",
+  "postcode_boundary_state_column": "STATE",
+  "postcode_boundary_simplify_tolerance": 0.00005,
   "district_boundary_dir": "data/boundary/03_District_boundary",
   "mukim_boundary_dir": "data/boundary/05_Mukim_boundary",
   "admin_boundary_simplify_tolerance": 0.00005
@@ -356,18 +468,26 @@ Vanity codes can be inserted later with `is_vanity=true`.
 bash run_all.sh
 ```
 
+`run_all.sh` validates required env vars before execution using `validate_env.py`.
+Disable check only if needed:
+```bash
+SKIP_ENV_CHECK=1 bash run_all.sh
+```
+
 `run_all.sh` input behavior:
 - If `PIPELINE_INPUT` is set, it uses that path.
 - Otherwise, it auto-uses `data/synthetic_data` and detects `csv/json/excel`.
 - If `data/synthetic_data` is not present, it falls back to `data/raw/Sample Data.xlsx`.
 
 `run_all.sh` performance modes:
-- `FAST_MODE=1`: development mode, uses `config/config.fast.json`, skips LLM and Postgres load by default, writes to `output/cleaned-fast` and `output/failed-fast`.
+- `FAST_MODE=1`: development mode, still uses `config/config.json`, skips LLM and Postgres load by default, writes to `output/cleaned-fast` and `output/failed-fast`.
 - Optional `FAST_SAMPLE_ROWS=<n>`: when input is a CSV directory, samples first `<n>` rows from one file for quick smoke tests.
 - Optional `PIPELINE_CHECKPOINT_ROOT=<path>`: checkpoint folder root.
 - Optional `PIPELINE_RESUME=1`: resume pipeline from checkpoints.
 - Optional `PIPELINE_STATUS_PATH=<path>`: record status store path.
 - Optional `PIPELINE_RESUME_FAILED_ONLY=1`: process only records not marked `DONE`.
+- Optional `SKIP_ES=0`: enable Elasticsearch startup + load.
+- Optional `ES_URL=<url>`, `ES_INDEX=<name>`, `ES_RECREATE_INDEX=1`, `ES_INPUT=<parquet path>`.
 
 Override examples:
 ```bash
@@ -377,6 +497,7 @@ FAST_MODE=1 FAST_SAMPLE_ROWS=5000 bash run_all.sh
 FAST_MODE=1 SKIP_LOAD=0 PIPELINE_SUCCESS=output/cleaned bash run_all.sh
 PIPELINE_CHECKPOINT_ROOT=output/checkpoints/job1 PIPELINE_RESUME=1 bash run_all.sh
 PIPELINE_CHECKPOINT_ROOT=output/checkpoints/job1 PIPELINE_RESUME=1 PIPELINE_RESUME_FAILED_ONLY=1 bash run_all.sh
+SKIP_ES=0 ES_INDEX=nas_addresses bash run_all.sh
 ```
 
 ## Audit Log

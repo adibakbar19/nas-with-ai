@@ -3,3 +3,11 @@ pandas
 openpyxl
 apache-sedona
 openai
+pyarrow
+requests
+fastapi
+uvicorn
+minio
+python-multipart
+psycopg[binary]
+boto3

@@ -15,6 +15,9 @@ This guide is a practical runbook for running the NAS Spark pipeline locally.
 ## 2) One-Time Config
 
 `run_all.sh` automatically loads `.env`.
+If missing, copy from `.env.example`.
+Store secrets only in `.env` (do not hardcode credentials in code/config).
+`run_all.sh` also validates required env vars before running. Bypass with `SKIP_ENV_CHECK=1`.
 
 Recommended Spark tuning in `.env`:
 
@@ -37,6 +40,7 @@ Behavior:
 - Writes:
   - success parquet to `output/cleaned`
   - failed parquet to `output/failed`
+- Skips Elasticsearch by default (`SKIP_ES=1`)
 
 ## 4) Fast Development Run
 
@@ -45,7 +49,7 @@ FAST_MODE=1 SKIP_LOAD=1 SKIP_LLM=1 bash run_all.sh
 ```
 
 Behavior:
-- Uses `config/config.fast.json`
+- Uses `config/config.json`
 - Writes:
   - `output/cleaned-fast`
   - `output/failed-fast`
@@ -146,7 +150,21 @@ SKIP_LOAD=0 bash run_all.sh
 
 This runs `load_postgres.py` and writes normalized tables to schema `nas`.
 
-## 9) Common Troubleshooting
+## 9) Optional Elasticsearch Load
+
+Enable Elasticsearch startup + indexing:
+
+```bash
+SKIP_ES=0 ES_INDEX=nas_addresses bash run_all.sh
+```
+
+Useful env vars:
+- `ES_URL` (default `http://localhost:9200`)
+- `ES_INDEX` (default `nas_addresses`)
+- `ES_RECREATE_INDEX` (`1` recreate, `0` keep existing)
+- `ES_INPUT` (default pipeline success output path)
+
+## 10) Common Troubleshooting
 
 - `_corrupt_record` only:
   - Ensure source type is JSON for `.json` input.
@@ -160,3 +178,56 @@ This runs `load_postgres.py` and writes normalized tables to schema `nas`.
   - Increase Spark memory in `.env`
   - Reduce workload (FAST mode / smaller input)
   - Move full run to larger cloud machine for production workloads.
+
+## 11) Start MinIO For Upload Feature
+
+```bash
+docker compose --profile objectstore up -d minio
+```
+
+Defaults:
+- API: `http://localhost:9000`
+- Console: `http://localhost:9001`
+- Bucket auto-created by backend: `nas-uploads`
+
+## 12) Run Backend + Vue Frontend
+
+Start API:
+
+```bash
+uvicorn backend.app.main:app --host 0.0.0.0 --port 8000 --reload
+```
+
+Start worker (required when `INGEST_EXECUTION_MODE=queue_worker`):
+
+```bash
+python -m backend.app.workers.queue_consumer
+```
+
+Optional Docker services:
+
+```bash
+docker compose --profile api up -d api
+docker compose --profile worker up -d worker
+```
+
+Start Vue UI in separate terminal:
+
+```bash
+cd frontend-vue
+npm install
+npm run dev
+```
+
+Open:
+- `http://localhost:5173/`
+
+Upload flow:
+- Upload CSV/JSON/Excel from UI.
+- Backend stores it in MinIO.
+- Backend writes ingest event to queue (`QUEUE_BACKEND`).
+- Worker consumes event and runs `pipeline.py`.
+- Output:
+  - `output/uploads/<job_id>/cleaned`
+  - `output/uploads/<job_id>/failed`
+  - `logs/jobs/<job_id>.log`

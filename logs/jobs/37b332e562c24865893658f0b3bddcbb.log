@@ -1,0 +1,57 @@
+[2026-02-27T02:34:13.699303+00:00] start job=37b332e562c24865893658f0b3bddcbb cmd=/Users/adibakbar/Software_Development/nas/venv/bin/python3.11 pipeline.py --input /Users/adibakbar/Software_Development/nas/data/uploads/37b332e562c24865893658f0b3bddcbb/Sample Data.xlsx --source-type excel --config config/config.json --success /Users/adibakbar/Software_Development/nas/output/uploads/37b332e562c24865893658f0b3bddcbb/cleaned --failed /Users/adibakbar/Software_Development/nas/output/uploads/37b332e562c24865893658f0b3bddcbb/failed --checkpoint-root /Users/adibakbar/Software_Development/nas/output/uploads/37b332e562c24865893658f0b3bddcbb/checkpoints
+WARNING: Using incubator modules: jdk.incubator.vector
+Using Spark's default log4j profile: org/apache/spark/log4j2-defaults.properties
+Setting default log level to "WARN".
+To adjust logging level use sc.setLogLevel(newLevel). For SparkR, use setLogLevel(newLevel).
+26/02/27 10:34:15 WARN NativeCodeLoader: Unable to load native-hadoop library for your platform... using builtin-java classes where applicable
+26/02/27 10:34:21 WARN SparkStringUtils: Truncated the string representation of a plan since it was too large. This behavior can be adjusted by setting 'spark.sql.debug.maxToStringFields'.
+
+[Stage 0:>                                                          (0 + 8) / 8]
+
+                                                                                
+PIPELINE_STAGE:clean
+
+[Stage 43:>                                                         (0 + 8) / 8]
+26/02/27 10:34:45 WARN DAGScheduler: Broadcasting large task binary with size 2.9 MiB
+
+[Stage 43:>                 (0 + 8) / 8][Stage 44:>                 (0 + 0) / 8]
+
+[Stage 43:======>           (3 + 5) / 8][Stage 44:>                 (0 + 3) / 8]
+
+[Stage 43:===============>  (7 + 1) / 8][Stage 44:>                 (0 + 7) / 8]
+
+[Stage 44:>                                                         (0 + 8) / 8]
+
+[Stage 44:====================================>                     (5 + 3) / 8]
+26/02/27 10:34:57 WARN DAGScheduler: Broadcasting large task binary with size 4.9 MiB
+
+[Stage 47:>                                                         (0 + 1) / 1]
+
+[Stage 47:>                                                         (0 + 1) / 1]
+
+[Stage 47:>                                                         (0 + 1) / 1]
+
+[Stage 47:>                                                         (0 + 1) / 1]
+
+[Stage 47:>                                                         (0 + 1) / 1]
+
+[Stage 47:>                                                         (0 + 1) / 1]
+
+[Stage 47:>                                                         (0 + 1) / 1]
+
+[Stage 47:>                                                         (0 + 1) / 1]
+
+[Stage 47:>                                                         (0 + 1) / 1]
+
+                                                                                
+
+[Stage 56:>                                                         (0 + 8) / 8]
+
+[Stage 56:====================================>                     (5 + 3) / 8]
+
+[Stage 58:>                                                         (0 + 1) / 1]
+
+[Stage 58:>                                                         (0 + 1) / 1]
+
+[Stage 58:>                                                         (0 + 1) / 1]
+
