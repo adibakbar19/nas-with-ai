@@ -17,7 +17,8 @@ def _load_env_file(env_path: Path) -> None:
         key = key.strip()
         value = value.strip().strip("'").strip('"')
         if key:
-            os.environ.setdefault(key, value)
+            # Force .env precedence during validation to match runtime behavior.
+            os.environ[key] = value
 
 
 def _as_bool(value: str) -> bool:

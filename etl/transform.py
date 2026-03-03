@@ -1,5 +1,6 @@
 import json
 import os
+import re
 from glob import glob
 from typing import Optional
 
@@ -26,13 +27,20 @@ from pyspark.sql.functions import (
     regexp_extract,
     size,
     trim,
+    udf,
     upper,
     when,
 )
+from pyspark.sql.types import IntegerType, StringType
 
+from domain.models import ConfidenceSignals
+from domain.scoring import calculate_confidence, confidence_band
 from .address_parse import parse_full_address
 from .lookup_match import match_lookup_exact, match_lookup_fuzzy, match_mukim_fuzzy
 from .sedona_utils import register_sedona
+
+DEFAULT_PBT_DIR = os.path.join("data", "boundary", "Sempadan Kawalan PBT")
+LEGACY_PBT_DIR = os.path.join("data", "Sempadan Kawalan PBT")
 
 
 def _normalize_col_name(name: str) -> str:
@@ -55,6 +63,338 @@ def _config_bool(config: dict, key: str, default: bool) -> bool:
     if isinstance(value, (int, float)):
         return bool(value)
     return bool(value)
+
+
+def _resolve_pbt_dir(path: Optional[str]) -> Optional[str]:
+    candidates: list[str] = []
+    if path:
+        candidates.append(path)
+        if path == LEGACY_PBT_DIR:
+            candidates.append(DEFAULT_PBT_DIR)
+        elif path == DEFAULT_PBT_DIR:
+            candidates.append(LEGACY_PBT_DIR)
+    candidates.extend([DEFAULT_PBT_DIR, LEGACY_PBT_DIR])
+    seen: set[str] = set()
+    deduped: list[str] = []
+    for candidate in candidates:
+        normalized = os.path.normpath(candidate)
+        if normalized in seen:
+            continue
+        seen.add(normalized)
+        deduped.append(candidate)
+    for candidate in deduped:
+        if os.path.exists(candidate):
+            return candidate
+    return None
+
+
+def _build_lookup_jdbc_url(config: dict) -> str:
+    jdbc_url = config.get("lookup_jdbc_url")
+    if jdbc_url:
+        return str(jdbc_url)
+    host = config.get("lookup_db_host", os.getenv("PGHOST", "localhost"))
+    port = str(config.get("lookup_db_port", os.getenv("PGPORT", "5432")))
+    database = config.get("lookup_db_name", os.getenv("PGDATABASE", "postgres"))
+    return f"jdbc:postgresql://{host}:{port}/{database}"
+
+
+def _read_jdbc_table(
+    spark,
+    *,
+    jdbc_url: str,
+    dbtable: str,
+    user: str,
+    password: str,
+):
+    return (
+        spark.read.format("jdbc")
+        .option("url", jdbc_url)
+        .option("dbtable", dbtable)
+        .option("user", user)
+        .option("password", password)
+        .option("driver", "org.postgresql.Driver")
+        .load()
+    )
+
+
+def _boundary_source(config: dict) -> str:
+    source = str(config.get("boundary_source", "files")).strip().lower()
+    if source in {"files", "db", "auto"}:
+        return source
+    return "files"
+
+
+def _sql_ident(name: str, *, label: str) -> str:
+    cleaned = str(name or "").strip()
+    if not re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", cleaned):
+        raise ValueError(f"Invalid SQL identifier for {label}: {name!r}")
+    return cleaned
+
+
+def _boundary_db_settings(config: dict) -> tuple[str, str, str, str]:
+    jdbc_url = str(config.get("boundary_jdbc_url", "")).strip() or _build_lookup_jdbc_url(config)
+    schema = str(config.get("boundary_db_schema", config.get("lookup_db_schema", os.getenv("PGSCHEMA", "nas")))).strip() or "nas"
+    user = str(config.get("boundary_db_user", config.get("lookup_db_user", os.getenv("PGUSER", "")))).strip()
+    password = str(config.get("boundary_db_password", config.get("lookup_db_password", os.getenv("PGPASSWORD", "")))).strip()
+    if not user or not password:
+        raise ValueError("boundary_source=db requires boundary_db_user/password (or lookup_db_user/password, or PGUSER/PGPASSWORD)")
+    return jdbc_url, schema, user, password
+
+
+def _load_boundary_frame_from_db(
+    spark,
+    *,
+    config: dict,
+    table_name: str,
+    select_cols: list[str],
+) -> DataFrame:
+    jdbc_url, schema, user, password = _boundary_db_settings(config)
+    schema_ident = _sql_ident(schema, label="boundary_db_schema")
+    table_ident = _sql_ident(table_name, label="boundary table")
+    selected = ", ".join(_sql_ident(col_name, label=f"{table_name} column") for col_name in select_cols)
+    dbtable = (
+        f"(SELECT {selected}, "
+        f"ST_AsText(ST_Force2D(boundary_geom::geometry)) AS _boundary_wkt "
+        f"FROM {schema_ident}.{table_ident}) boundary_src"
+    )
+    df = _read_jdbc_table(
+        spark,
+        jdbc_url=jdbc_url,
+        dbtable=dbtable,
+        user=user,
+        password=password,
+    )
+    return df.withColumn("geom", expr("ST_GeomFromWKT(_boundary_wkt)")).drop("_boundary_wkt")
+
+
+def _sanitize_cache_token(token: str) -> str:
+    safe = re.sub(r"[^A-Za-z0-9_.-]+", "_", token.strip())
+    return safe or "noversion"
+
+
+def _materialize_lookup_cache(cache_dir: str, lookup_frames: dict[str, DataFrame]) -> None:
+    for name, frame in lookup_frames.items():
+        frame.write.mode("overwrite").parquet(os.path.join(cache_dir, name))
+
+
+def _cache_exists(cache_dir: str, required_keys: list[str]) -> bool:
+    return all(os.path.exists(os.path.join(cache_dir, key)) for key in required_keys)
+
+
+def _load_lookups_from_files(spark, lookups_dir: str, config: Optional[dict] = None):
+    cfg = config or {}
+    state_df = spark.read.csv(os.path.join(lookups_dir, "state_codes.csv"), header=True)
+    district_df = spark.read.csv(os.path.join(lookups_dir, "district_codes.csv"), header=True)
+    mukim_df = spark.read.csv(os.path.join(lookups_dir, "mukim_codes.csv"), header=True)
+    postcode_df = spark.read.csv(os.path.join(lookups_dir, "postcodes.csv"), header=True)
+    locality_lookup_df = None
+    sublocality_lookup_df = None
+    locality_lookup_path = cfg.get("locality_lookup_path", os.path.join(lookups_dir, "locality_lookup.csv"))
+    if locality_lookup_path and os.path.exists(locality_lookup_path):
+        locality_lookup_df = spark.read.csv(locality_lookup_path, header=True)
+    sublocality_lookup_path = cfg.get("sub_locality_lookup_path", os.path.join(lookups_dir, "sublocality_lookup.csv"))
+    if sublocality_lookup_path and os.path.exists(sublocality_lookup_path):
+        sublocality_lookup_df = spark.read.csv(sublocality_lookup_path, header=True)
+    return state_df, district_df, mukim_df, postcode_df, locality_lookup_df, sublocality_lookup_df
+
+
+def _load_lookups_from_db(spark, *, config: dict):
+    jdbc_url = _build_lookup_jdbc_url(config)
+    schema = str(config.get("lookup_db_schema", os.getenv("PGSCHEMA", "nas"))).strip() or "nas"
+    user = str(config.get("lookup_db_user", os.getenv("PGUSER", ""))).strip()
+    password = str(config.get("lookup_db_password", os.getenv("PGPASSWORD", ""))).strip()
+    if not user or not password:
+        raise ValueError("lookup_source=db requires lookup_db_user/lookup_db_password or PGUSER/PGPASSWORD")
+
+    lookup_version = "noversion"
+    try:
+        version_df = _read_jdbc_table(
+            spark,
+            jdbc_url=jdbc_url,
+            dbtable=(
+                f"(SELECT COALESCE(MAX(version), TO_CHAR(MAX(updated_at), 'YYYYMMDDHH24MISSMS'), 'noversion') AS version "
+                f"FROM {schema}.lookup_version) lv"
+            ),
+            user=user,
+            password=password,
+        )
+        rows = version_df.collect()
+        if rows and rows[0]["version"]:
+            lookup_version = str(rows[0]["version"])
+    except Exception as exc:
+        print(f"Warning: failed to read lookup_version from DB, using non-versioned cache key: {exc}")
+
+    cache_enabled = _config_bool(config, "lookup_cache_enabled", True)
+    cache_root = str(config.get("lookup_cache_dir", os.path.join("output", "lookups_cache")))
+    cache_token = _sanitize_cache_token(f"{schema}_{lookup_version}")
+    cache_dir = os.path.join(cache_root, cache_token)
+    required = ["state", "district", "mukim", "postcode"]
+
+    if cache_enabled and _cache_exists(cache_dir, required):
+        print(f"Info: using cached lookup parquet from {cache_dir}")
+        state_df = spark.read.parquet(os.path.join(cache_dir, "state"))
+        district_df = spark.read.parquet(os.path.join(cache_dir, "district"))
+        mukim_df = spark.read.parquet(os.path.join(cache_dir, "mukim"))
+        postcode_df = spark.read.parquet(os.path.join(cache_dir, "postcode"))
+        locality_lookup_df = None
+        sublocality_lookup_df = None
+        locality_cache = os.path.join(cache_dir, "locality_lookup")
+        sublocality_cache = os.path.join(cache_dir, "sublocality_lookup")
+        if os.path.exists(locality_cache):
+            locality_lookup_df = spark.read.parquet(locality_cache)
+        if os.path.exists(sublocality_cache):
+            sublocality_lookup_df = spark.read.parquet(sublocality_cache)
+    else:
+        print(f"Info: loading lookups from DB schema={schema}")
+        state_df = _read_jdbc_table(
+            spark,
+            jdbc_url=jdbc_url,
+            dbtable=f"(SELECT state_code, state_name FROM {schema}.state) state_lookup",
+            user=user,
+            password=password,
+        )
+        district_df = _read_jdbc_table(
+            spark,
+            jdbc_url=jdbc_url,
+            dbtable=(
+                f"(SELECT s.state_code, d.district_code, d.district_name "
+                f"FROM {schema}.district d "
+                f"LEFT JOIN {schema}.state s ON s.state_id = d.state_id) district_lookup"
+            ),
+            user=user,
+            password=password,
+        )
+        mukim_df = _read_jdbc_table(
+            spark,
+            jdbc_url=jdbc_url,
+            dbtable=(
+                f"(SELECT s.state_code, s.state_name, d.district_code, d.district_name, "
+                f"m.mukim_code, m.mukim_name, m.mukim_id "
+                f"FROM {schema}.mukim m "
+                f"LEFT JOIN {schema}.district d ON d.district_id = m.district_id "
+                f"LEFT JOIN {schema}.state s ON s.state_id = d.state_id) mukim_lookup"
+            ),
+            user=user,
+            password=password,
+        )
+        postcode_df = _read_jdbc_table(
+            spark,
+            jdbc_url=jdbc_url,
+            dbtable=(
+                f"(SELECT p.postcode, p.postcode_name AS city, s.state_name AS state, s.state_code "
+                f"FROM {schema}.postcode p "
+                f"LEFT JOIN {schema}.locality l ON l.locality_id = p.locality_id "
+                f"LEFT JOIN {schema}.mukim m ON m.mukim_id = l.mukim_id "
+                f"LEFT JOIN {schema}.district d ON d.district_id = m.district_id "
+                f"LEFT JOIN {schema}.state s ON s.state_id = d.state_id) postcode_lookup"
+            ),
+            user=user,
+            password=password,
+        )
+        locality_lookup_df = _read_jdbc_table(
+            spark,
+            jdbc_url=jdbc_url,
+            dbtable=(
+                f"(SELECT l.locality_name, s.state_name "
+                f"FROM {schema}.locality l "
+                f"LEFT JOIN {schema}.mukim m ON m.mukim_id = l.mukim_id "
+                f"LEFT JOIN {schema}.district d ON d.district_id = m.district_id "
+                f"LEFT JOIN {schema}.state s ON s.state_id = d.state_id) locality_lookup"
+            ),
+            user=user,
+            password=password,
+        )
+        try:
+            sublocality_lookup_df = _read_jdbc_table(
+                spark,
+                jdbc_url=jdbc_url,
+                dbtable=(
+                    f"(SELECT sb.sublocality_name AS sub_locality_name, s.state_name "
+                    f"FROM {schema}.sublocality sb "
+                    f"LEFT JOIN {schema}.state s ON s.state_id = sb.state_id) sublocality_lookup"
+                ),
+                user=user,
+                password=password,
+            )
+        except Exception as exc:
+            sublocality_lookup_df = None
+            print(f"Warning: failed to read {schema}.sublocality, sub-locality DB lookup disabled: {exc}")
+        if cache_enabled:
+            os.makedirs(cache_dir, exist_ok=True)
+            lookup_frames = {
+                "state": state_df,
+                "district": district_df,
+                "mukim": mukim_df,
+                "postcode": postcode_df,
+                "locality_lookup": locality_lookup_df,
+            }
+            if sublocality_lookup_df is not None:
+                lookup_frames["sublocality_lookup"] = sublocality_lookup_df
+            _materialize_lookup_cache(cache_dir, lookup_frames)
+            print(f"Info: wrote lookup cache to {cache_dir}")
+
+    if _config_bool(config, "lookup_memory_cache_enabled", True):
+        state_df = state_df.cache()
+        district_df = district_df.cache()
+        mukim_df = mukim_df.cache()
+        postcode_df = postcode_df.cache()
+        if locality_lookup_df is not None:
+            locality_lookup_df = locality_lookup_df.cache()
+        if sublocality_lookup_df is not None:
+            sublocality_lookup_df = sublocality_lookup_df.cache()
+        # Materialize once so repeated joins in transform reuse cached partitions.
+        state_df.count()
+        district_df.count()
+        mukim_df.count()
+        postcode_df.count()
+        if locality_lookup_df is not None:
+            locality_lookup_df.count()
+        if sublocality_lookup_df is not None:
+            sublocality_lookup_df.count()
+    return state_df, district_df, mukim_df, postcode_df, locality_lookup_df, sublocality_lookup_df
+
+
+def load_lookups(spark, lookups_dir: str = "data/lookups", config: Optional[dict] = None):
+    cfg = config or {}
+    source = str(cfg.get("lookup_source", "files")).strip().lower()
+    if source == "db":
+        state_df, district_df, mukim_df, postcode_df, locality_lookup_df, sublocality_lookup_df = _load_lookups_from_db(
+            spark, config=cfg
+        )
+    else:
+        state_df, district_df, mukim_df, postcode_df, locality_lookup_df, sublocality_lookup_df = _load_lookups_from_files(
+            spark, lookups_dir, cfg
+        )
+        if _config_bool(cfg, "lookup_memory_cache_enabled", False):
+            state_df = state_df.cache()
+            district_df = district_df.cache()
+            mukim_df = mukim_df.cache()
+            postcode_df = postcode_df.cache()
+            if locality_lookup_df is not None:
+                locality_lookup_df = locality_lookup_df.cache()
+            if sublocality_lookup_df is not None:
+                sublocality_lookup_df = sublocality_lookup_df.cache()
+            state_df.count()
+            district_df.count()
+            mukim_df.count()
+            postcode_df.count()
+            if locality_lookup_df is not None:
+                locality_lookup_df.count()
+            if sublocality_lookup_df is not None:
+                sublocality_lookup_df.count()
+    district_alias_path = os.path.join(lookups_dir, "district_aliases.csv")
+    district_alias_df = None
+    if os.path.exists(district_alias_path):
+        district_alias_df = spark.read.csv(district_alias_path, header=True)
+    return (
+        state_df,
+        district_df,
+        mukim_df,
+        postcode_df,
+        district_alias_df,
+        locality_lookup_df,
+        sublocality_lookup_df,
+    )
 
 
 def _detect_address_col(df: DataFrame, candidates: list[str]) -> Optional[str]:
@@ -93,18 +433,6 @@ def _detect_address_col(df: DataFrame, candidates: list[str]) -> Optional[str]:
     if len(matches) == 1:
         return matches[0]
     return None
-
-
-def load_lookups(spark, lookups_dir: str = "data/lookups"):
-    state_df = spark.read.csv(os.path.join(lookups_dir, "state_codes.csv"), header=True)
-    district_df = spark.read.csv(os.path.join(lookups_dir, "district_codes.csv"), header=True)
-    mukim_df = spark.read.csv(os.path.join(lookups_dir, "mukim_codes.csv"), header=True)
-    postcode_df = spark.read.csv(os.path.join(lookups_dir, "postcodes.csv"), header=True)
-    district_alias_path = os.path.join(lookups_dir, "district_aliases.csv")
-    district_alias_df = None
-    if os.path.exists(district_alias_path):
-        district_alias_df = spark.read.csv(district_alias_path, header=True)
-    return state_df, district_df, mukim_df, postcode_df, district_alias_df
 
 
 def _detect_new_address_col(df: DataFrame, candidates: list[str]) -> Optional[str]:
@@ -150,6 +478,75 @@ def _clean_text_expr(value_col):
         txt.isNull() | txt_norm.isin("", "nan", "null", "none", "na", "n/a"),
         lit(None).cast("string"),
     ).otherwise(txt)
+
+
+def _to_bool(value: bool | None) -> bool:
+    return bool(value) if value is not None else False
+
+
+def _calculate_confidence_row(
+    has_postcode: bool | None,
+    has_state: bool | None,
+    has_district: bool | None,
+    has_mukim: bool | None,
+    has_locality: bool | None,
+    has_pbt: bool | None,
+    has_postcode_boundary: bool | None,
+    state_from_postcode: bool | None,
+    state_from_locality: bool | None,
+    has_district_and_mukim: bool | None,
+    has_pbt_and_state: bool | None,
+    has_state_boundary: bool | None,
+    has_district_boundary: bool | None,
+    has_mukim_boundary: bool | None,
+    has_state_boundary_conflict: bool | None,
+    has_district_boundary_conflict: bool | None,
+    has_mukim_boundary_conflict: bool | None,
+    has_postcode_boundary_conflict: bool | None,
+    state_conflict_postcode: bool | None,
+    suspicious_locality_has_mukim: bool | None,
+    suspicious_sub_has_street: bool | None,
+    suspicious_sub_has_bandar: bool | None,
+    suspicious_missing_street: bool | None,
+) -> int:
+    signals = ConfidenceSignals(
+        has_postcode=_to_bool(has_postcode),
+        has_state=_to_bool(has_state),
+        has_district=_to_bool(has_district),
+        has_mukim=_to_bool(has_mukim),
+        has_locality=_to_bool(has_locality),
+        has_pbt=_to_bool(has_pbt),
+        has_postcode_boundary=_to_bool(has_postcode_boundary),
+        state_from_postcode=_to_bool(state_from_postcode),
+        state_from_locality=_to_bool(state_from_locality),
+        has_district_and_mukim=_to_bool(has_district_and_mukim),
+        has_pbt_and_state=_to_bool(has_pbt_and_state),
+        has_state_boundary=_to_bool(has_state_boundary),
+        has_district_boundary=_to_bool(has_district_boundary),
+        has_mukim_boundary=_to_bool(has_mukim_boundary),
+        has_state_boundary_conflict=_to_bool(has_state_boundary_conflict),
+        has_district_boundary_conflict=_to_bool(has_district_boundary_conflict),
+        has_mukim_boundary_conflict=_to_bool(has_mukim_boundary_conflict),
+        has_postcode_boundary_conflict=_to_bool(has_postcode_boundary_conflict),
+        state_conflict_postcode=_to_bool(state_conflict_postcode),
+        suspicious_locality_has_mukim=_to_bool(suspicious_locality_has_mukim),
+        suspicious_sub_has_street=_to_bool(suspicious_sub_has_street),
+        suspicious_sub_has_bandar=_to_bool(suspicious_sub_has_bandar),
+        suspicious_missing_street=_to_bool(suspicious_missing_street),
+    )
+    return calculate_confidence(signals)
+
+
+_CALCULATE_CONFIDENCE_UDF = udf(_calculate_confidence_row, IntegerType())
+
+
+def _confidence_band_row(score: int | None) -> str:
+    if score is None:
+        return "REJECT"
+    return confidence_band(int(score))
+
+
+_CONFIDENCE_BAND_UDF = udf(_confidence_band_row, StringType())
 
 
 def _standardize_common_columns(df: DataFrame, config: dict) -> DataFrame:
@@ -642,7 +1039,11 @@ def clean_addresses(
 ) -> DataFrame:
     config = _load_config(config_path)
     spark = df.sparkSession
-    state_df, district_df, mukim_df, postcode_df, district_alias_df = load_lookups(spark, lookups_dir)
+    state_df, district_df, mukim_df, postcode_df, district_alias_df, locality_lookup_df, sublocality_lookup_df = load_lookups(
+        spark,
+        lookups_dir,
+        config=config,
+    )
     df = _standardize_common_columns(df, config)
     preserve_after_parse = [
         "premise_no",
@@ -918,54 +1319,83 @@ def clean_addresses(
         ).otherwise(col("postcode_code")),
     )
 
+    boundary_source = _boundary_source(config)
     postcode_boundary_enabled = config.get("postcode_boundary_enabled", True)
     strict_boundary_validation = _config_bool(config, "strict_boundary_validation", True)
     strict_postcode_boundary = _config_bool(config, "strict_postcode_boundary", strict_boundary_validation)
     strict_admin_boundary = _config_bool(config, "strict_admin_boundary", strict_boundary_validation)
     postcode_boundary_dir = config.get("postcode_boundary_dir", os.path.join("data", "boundary", "02_Postcode_boundary"))
     postcode_boundary_simplify_tolerance = float(config.get("postcode_boundary_simplify_tolerance", 0.0))
-    if postcode_boundary_enabled and postcode_boundary_dir and os.path.exists(postcode_boundary_dir):
-        try:
-            register_sedona(spark)
-            postcode_boundary_df = _load_pbt_boundaries(
-                spark,
-                postcode_boundary_dir,
-                simplify_tolerance=postcode_boundary_simplify_tolerance,
-            )
-            boundary_cols = {c.lower(): c for c in postcode_boundary_df.columns}
-            postcode_boundary_postcode_col = config.get("postcode_boundary_postcode_column", "POSTCODE")
-            postcode_boundary_city_col = config.get("postcode_boundary_city_column", "TOWN_CITY")
-            postcode_boundary_state_col = config.get("postcode_boundary_state_column", "STATE")
-            postcode_boundary_postcode_col = boundary_cols.get(postcode_boundary_postcode_col.lower())
-            postcode_boundary_city_col = boundary_cols.get(postcode_boundary_city_col.lower())
-            postcode_boundary_state_col = boundary_cols.get(postcode_boundary_state_col.lower())
-            if not postcode_boundary_postcode_col or not postcode_boundary_city_col or not postcode_boundary_state_col:
-                raise ValueError(
-                    "Postcode boundary shapefile missing required columns. "
-                    f"Found: {sorted(postcode_boundary_df.columns)}"
+    postcode_boundary_df = None
+    postcode_boundary_error: Exception | None = None
+    if postcode_boundary_enabled:
+        if boundary_source in {"db", "auto"}:
+            try:
+                register_sedona(spark)
+                postcode_boundary_table = str(config.get("postcode_boundary_table", "postcode_boundary")).strip() or "postcode_boundary"
+                postcode_boundary_df = _load_boundary_frame_from_db(
+                    spark,
+                    config=config,
+                    table_name=postcode_boundary_table,
+                    select_cols=["postcode", "city", "state"],
                 )
-            df = _assign_postcode_from_boundary(
-                df,
-                postcode_boundary_df,
-                postcode_col=postcode_boundary_postcode_col,
-                city_col=postcode_boundary_city_col,
-                state_col=postcode_boundary_state_col,
-            )
-        except Exception as exc:
-            if strict_postcode_boundary:
-                raise RuntimeError(
-                    "Postcode boundary validation is enabled but failed. "
-                    "Fix Sedona/shapefile setup or set strict_postcode_boundary=false."
-                ) from exc
-            print(f"Warning: Postcode boundary mapping skipped due to Sedona/shapefile issue: {exc}")
-            df = df.withColumn("_postcode_from_boundary", lit(False))
-            df = df.withColumn("_postcode_boundary_conflict", lit(False))
-    else:
+            except Exception as exc:
+                postcode_boundary_error = exc
+                if boundary_source == "auto":
+                    print(f"Warning: Postcode boundary DB mapping failed, falling back to files: {exc}")
+        if postcode_boundary_df is None and boundary_source in {"files", "auto"}:
+            if postcode_boundary_dir and os.path.exists(postcode_boundary_dir):
+                try:
+                    register_sedona(spark)
+                    postcode_boundary_df = _load_pbt_boundaries(
+                        spark,
+                        postcode_boundary_dir,
+                        simplify_tolerance=postcode_boundary_simplify_tolerance,
+                    )
+                except Exception as exc:
+                    postcode_boundary_error = exc
+            else:
+                postcode_boundary_error = FileNotFoundError(
+                    f"Postcode boundary directory is unavailable: {postcode_boundary_dir}"
+                )
+        if postcode_boundary_df is not None:
+            try:
+                postcode_boundary_postcode_col = _pick_boundary_col(
+                    postcode_boundary_df,
+                    [str(config.get("postcode_boundary_postcode_column", "POSTCODE")), "postcode"],
+                )
+                postcode_boundary_city_col = _pick_boundary_col(
+                    postcode_boundary_df,
+                    [str(config.get("postcode_boundary_city_column", "TOWN_CITY")), "city", "town_city"],
+                )
+                postcode_boundary_state_col = _pick_boundary_col(
+                    postcode_boundary_df,
+                    [str(config.get("postcode_boundary_state_column", "STATE")), "state"],
+                )
+                if not postcode_boundary_postcode_col or not postcode_boundary_city_col or not postcode_boundary_state_col:
+                    raise ValueError(
+                        "Postcode boundary source missing required columns. "
+                        f"Found: {sorted(postcode_boundary_df.columns)}"
+                    )
+                df = _assign_postcode_from_boundary(
+                    df,
+                    postcode_boundary_df,
+                    postcode_col=postcode_boundary_postcode_col,
+                    city_col=postcode_boundary_city_col,
+                    state_col=postcode_boundary_state_col,
+                )
+            except Exception as exc:
+                postcode_boundary_error = exc
+                postcode_boundary_df = None
+    if postcode_boundary_df is None:
         if postcode_boundary_enabled and strict_postcode_boundary:
-            raise FileNotFoundError(
-                "Postcode boundary validation is enabled but boundary directory is unavailable: "
-                f"{postcode_boundary_dir}"
-            )
+            raise RuntimeError(
+                "Postcode boundary validation is enabled but failed. "
+                f"boundary_source={boundary_source}. "
+                "Fix Sedona/boundary setup or disable strict_postcode_boundary."
+            ) from postcode_boundary_error
+        if postcode_boundary_enabled and postcode_boundary_error is not None:
+            print(f"Warning: Postcode boundary mapping skipped due to setup issue: {postcode_boundary_error}")
         df = df.withColumn("_postcode_from_boundary", lit(False))
         df = df.withColumn("_postcode_boundary_conflict", lit(False))
 
@@ -983,9 +1413,10 @@ def clean_addresses(
         "locality_lookup_path",
         os.path.join(lookups_dir, "locality_lookup.csv"),
     )
-    if locality_enabled and locality_lookup_path and os.path.exists(locality_lookup_path):
-        locality_df = spark.read.csv(locality_lookup_path, header=True)
-        locality_lookup = locality_df.select(
+    if locality_enabled and locality_lookup_df is None and locality_lookup_path and os.path.exists(locality_lookup_path):
+        locality_lookup_df = spark.read.csv(locality_lookup_path, header=True)
+    if locality_enabled and locality_lookup_df is not None:
+        locality_lookup = locality_lookup_df.select(
             col("locality_name"),
             col("state_name").alias("_lk_locality_state_name"),
         )
@@ -1018,6 +1449,63 @@ def clean_addresses(
             "_locality_state_name",
             coalesce(col("_locality_state_name"), col("_lk_locality_state_name")),
         ).drop("_lk_locality_state_name", "_locality_name_orig", "_locality_name_exact")
+
+    sublocality_enabled = _config_bool(config, "sublocality_enabled", True)
+    sublocality_lookup_path = config.get(
+        "sub_locality_lookup_path",
+        os.path.join(lookups_dir, "sublocality_lookup.csv"),
+    )
+    if sublocality_enabled and sublocality_lookup_df is None and sublocality_lookup_path and os.path.exists(sublocality_lookup_path):
+        sublocality_lookup_df = spark.read.csv(sublocality_lookup_path, header=True)
+    if sublocality_enabled and sublocality_lookup_df is not None:
+        sublocality_lookup_base = (
+            sublocality_lookup_df.select(
+                upper(trim(col("sub_locality_name"))).alias("sub_locality_name"),
+                upper(trim(col("state_name"))).alias("state_name"),
+            )
+            .filter(col("sub_locality_name").isNotNull() & col("state_name").isNotNull())
+            .dropDuplicates(["sub_locality_name", "state_name"])
+        )
+        for sub_col in ["sub_locality_1", "sub_locality_2"]:
+            lk_state_col = f"_lk_{sub_col}_state_name"
+            sub_lookup = sublocality_lookup_base.select(
+                col("sub_locality_name").alias(sub_col),
+                col("state_name").alias(lk_state_col),
+            )
+            df = _rename_if_exists(df, sub_col, f"_{sub_col}_orig")
+            df = match_lookup_exact(df, sub_lookup, sub_col, [sub_col, lk_state_col])
+            df = df.withColumn(sub_col, coalesce(col(sub_col), col(f"_{sub_col}_orig")))
+
+            df = _rename_if_exists(df, sub_col, f"_{sub_col}_exact")
+            if sub_col in df.columns:
+                df = df.drop(sub_col)
+            if lk_state_col in df.columns:
+                df = df.drop(lk_state_col)
+            df = match_lookup_fuzzy(
+                df,
+                sub_lookup,
+                sub_col,
+                [sub_col, lk_state_col],
+                state_name_col="state_name",
+                lookup_state_name_col=lk_state_col,
+                seg_cols=["seg2_norm", "seg3_norm", "seg4_norm", "seg5_norm", "tail2_norm", "tail3_norm", "tail4_norm"],
+                max_dist_short=1,
+                max_dist_long=2,
+            )
+            df = df.withColumn(sub_col, coalesce(col(sub_col), col(f"_{sub_col}_exact"))).drop(
+                lk_state_col, f"_{sub_col}_orig", f"_{sub_col}_exact"
+            )
+
+        # Re-normalize final sub-locality arrays after lookup canonicalization.
+        df = df.withColumn("_sub1_clean", _clean_text_expr(col("sub_locality_1")))
+        df = df.withColumn("_sub2_clean", _clean_text_expr(col("sub_locality_2")))
+        df = df.withColumn(
+            "sub_locality_levels",
+            expr("array_distinct(filter(array(_sub1_clean, _sub2_clean), x -> x is not null and length(trim(x)) > 0))"),
+        )
+        df = df.withColumn("sub_locality_1", expr("try_element_at(sub_locality_levels, 1)"))
+        df = df.withColumn("sub_locality_2", expr("try_element_at(sub_locality_levels, 2)"))
+        df = df.drop("_sub1_clean", "_sub2_clean")
 
     df = _ensure_column(df, "floor_level")
     df = df.withColumn("floor_level", coalesce(col("floor_level"), col("floor_no")))
@@ -1173,54 +1661,93 @@ def clean_addresses(
     district_boundary_dir = config.get("district_boundary_dir", os.path.join("data", "boundary", "03_District_boundary"))
     mukim_boundary_dir = config.get("mukim_boundary_dir", os.path.join("data", "boundary", "05_Mukim_boundary"))
     admin_boundary_simplify_tolerance = float(config.get("admin_boundary_simplify_tolerance", 0.0))
-    admin_boundary_missing: list[str] = []
+    admin_boundary_error: Exception | None = None
+    state_boundary_df = None
+    district_boundary_df = None
+    mukim_boundary_df = None
     if admin_boundary_enabled:
-        for path in [state_boundary_dir, district_boundary_dir, mukim_boundary_dir]:
-            if not os.path.exists(path):
-                admin_boundary_missing.append(path)
-    if admin_boundary_enabled and not admin_boundary_missing:
-        try:
-            register_sedona(spark)
-            state_boundary_df = _load_pbt_boundaries(
-                spark,
-                state_boundary_dir,
-                simplify_tolerance=admin_boundary_simplify_tolerance,
-            )
-            district_boundary_df = _load_pbt_boundaries(
-                spark,
-                district_boundary_dir,
-                simplify_tolerance=admin_boundary_simplify_tolerance,
-            )
-            mukim_boundary_df = _load_pbt_boundaries(
-                spark,
-                mukim_boundary_dir,
-                simplify_tolerance=admin_boundary_simplify_tolerance,
-            )
-            df = _assign_admin_from_boundaries(
-                df,
-                state_df=state_boundary_df,
-                district_df=district_boundary_df,
-                mukim_df=mukim_boundary_df,
-            )
-        except Exception as exc:
-            if strict_admin_boundary:
-                raise RuntimeError(
-                    "Admin boundary validation is enabled but failed. "
-                    "Fix Sedona/shapefile setup or set strict_admin_boundary=false."
-                ) from exc
-            print(f"Warning: Admin boundary mapping skipped due to Sedona/shapefile issue: {exc}")
-            df = df.withColumn("_state_from_boundary", lit(False))
-            df = df.withColumn("_district_from_boundary", lit(False))
-            df = df.withColumn("_mukim_from_boundary", lit(False))
-            df = df.withColumn("_state_boundary_conflict", lit(False))
-            df = df.withColumn("_district_boundary_conflict", lit(False))
-            df = df.withColumn("_mukim_boundary_conflict", lit(False))
-    else:
+        if boundary_source in {"db", "auto"}:
+            try:
+                register_sedona(spark)
+                state_boundary_df = _load_boundary_frame_from_db(
+                    spark,
+                    config=config,
+                    table_name=str(config.get("state_boundary_table", "state_boundary")).strip() or "state_boundary",
+                    select_cols=["state_code", "state_name"],
+                )
+                district_boundary_df = _load_boundary_frame_from_db(
+                    spark,
+                    config=config,
+                    table_name=str(config.get("district_boundary_table", "district_boundary")).strip() or "district_boundary",
+                    select_cols=["state_code", "district_code", "district_name"],
+                )
+                mukim_boundary_df = _load_boundary_frame_from_db(
+                    spark,
+                    config=config,
+                    table_name=str(config.get("mukim_boundary_table", "mukim_boundary")).strip() or "mukim_boundary",
+                    select_cols=["state_code", "district_code", "district_name", "mukim_code", "mukim_name", "mukim_id"],
+                )
+            except Exception as exc:
+                admin_boundary_error = exc
+                state_boundary_df = None
+                district_boundary_df = None
+                mukim_boundary_df = None
+                if boundary_source == "auto":
+                    print(f"Warning: Admin boundary DB mapping failed, falling back to files: {exc}")
+        if (state_boundary_df is None or district_boundary_df is None or mukim_boundary_df is None) and boundary_source in {"files", "auto"}:
+            admin_boundary_missing: list[str] = []
+            for path in [state_boundary_dir, district_boundary_dir, mukim_boundary_dir]:
+                if not os.path.exists(path):
+                    admin_boundary_missing.append(path)
+            if not admin_boundary_missing:
+                try:
+                    register_sedona(spark)
+                    state_boundary_df = _load_pbt_boundaries(
+                        spark,
+                        state_boundary_dir,
+                        simplify_tolerance=admin_boundary_simplify_tolerance,
+                    )
+                    district_boundary_df = _load_pbt_boundaries(
+                        spark,
+                        district_boundary_dir,
+                        simplify_tolerance=admin_boundary_simplify_tolerance,
+                    )
+                    mukim_boundary_df = _load_pbt_boundaries(
+                        spark,
+                        mukim_boundary_dir,
+                        simplify_tolerance=admin_boundary_simplify_tolerance,
+                    )
+                except Exception as exc:
+                    admin_boundary_error = exc
+                    state_boundary_df = None
+                    district_boundary_df = None
+                    mukim_boundary_df = None
+            else:
+                admin_boundary_error = FileNotFoundError(
+                    "Required admin boundary directories are unavailable: " + ", ".join(admin_boundary_missing)
+                )
+        if state_boundary_df is not None and district_boundary_df is not None and mukim_boundary_df is not None:
+            try:
+                df = _assign_admin_from_boundaries(
+                    df,
+                    state_df=state_boundary_df,
+                    district_df=district_boundary_df,
+                    mukim_df=mukim_boundary_df,
+                )
+            except Exception as exc:
+                admin_boundary_error = exc
+                state_boundary_df = None
+                district_boundary_df = None
+                mukim_boundary_df = None
+    if state_boundary_df is None or district_boundary_df is None or mukim_boundary_df is None:
         if admin_boundary_enabled and strict_admin_boundary:
-            raise FileNotFoundError(
-                "Admin boundary validation is enabled but required directories are unavailable: "
-                + ", ".join(admin_boundary_missing)
-            )
+            raise RuntimeError(
+                "Admin boundary validation is enabled but failed. "
+                f"boundary_source={boundary_source}. "
+                "Fix Sedona/boundary setup or disable strict_admin_boundary."
+            ) from admin_boundary_error
+        if admin_boundary_enabled and admin_boundary_error is not None:
+            print(f"Warning: Admin boundary mapping skipped due to setup issue: {admin_boundary_error}")
         df = df.withColumn("_state_from_boundary", lit(False))
         df = df.withColumn("_district_from_boundary", lit(False))
         df = df.withColumn("_mukim_from_boundary", lit(False))
@@ -1289,10 +1816,13 @@ def clean_addresses(
     df = df.drop("_mk_state_code", "_mk_district_code", "_mk_mukim_code", "_mk_mukim_name", "_mk_mukim_id")
 
     pbt_enabled = config.get("pbt_enabled", True)
-    pbt_dir = config.get("pbt_dir", os.path.join("data", "Sempadan Kawalan PBT"))
+    requested_pbt_dir = config.get("pbt_dir", DEFAULT_PBT_DIR)
+    pbt_dir = _resolve_pbt_dir(requested_pbt_dir)
     pbt_simplify_tolerance = float(config.get("pbt_simplify_tolerance", 0.0))
-    if pbt_enabled and pbt_dir and os.path.exists(pbt_dir):
+    if pbt_enabled and pbt_dir:
         try:
+            if requested_pbt_dir != pbt_dir:
+                print(f"Info: resolved PBT directory from {requested_pbt_dir} to {pbt_dir}")
             register_sedona(spark)
             pbt_df = _load_pbt_boundaries(spark, pbt_dir, simplify_tolerance=pbt_simplify_tolerance)
             pbt_cols = {c.lower(): c for c in pbt_df.columns}
@@ -1313,6 +1843,11 @@ def clean_addresses(
             )
         except Exception as exc:
             print(f"Warning: PBT mapping skipped due to Sedona/shapefile issue: {exc}")
+    elif pbt_enabled:
+        print(
+            "Warning: PBT mapping skipped because boundary directory is unavailable. "
+            f"Requested: {requested_pbt_dir}"
+        )
 
     state_map = state_df.select(
         upper(col("state_name")).alias("_state_name_lookup"),
@@ -1365,37 +1900,33 @@ def clean_addresses(
     suspicious_locality_has_mukim = locality_norm.rlike(r"\\bMUKIM\\b")
     suspicious_missing_street = col("street_name").isNull() | (length(trim(col("street_name"))) == 0)
 
-    confidence = lit(0)
-    confidence = confidence + when(has_postcode, lit(10)).otherwise(lit(0))
-    confidence = confidence + when(has_state, lit(20)).otherwise(lit(0))
-    confidence = confidence + when(has_district, lit(20)).otherwise(lit(0))
-    confidence = confidence + when(has_mukim, lit(15)).otherwise(lit(0))
-    confidence = confidence + when(has_locality, lit(10)).otherwise(lit(0))
-    confidence = confidence + when(has_pbt, lit(10)).otherwise(lit(0))
-    confidence = confidence + when(has_postcode_boundary, lit(10)).otherwise(lit(0))
-    confidence = confidence + when(state_from_postcode, lit(5)).otherwise(lit(0))
-    confidence = confidence + when(state_from_locality, lit(5)).otherwise(lit(0))
-    confidence = confidence + when(has_district & has_mukim, lit(5)).otherwise(lit(0))
-    confidence = confidence + when(has_pbt & has_state, lit(5)).otherwise(lit(0))
-    confidence = confidence + when(has_state_boundary, lit(10)).otherwise(lit(0))
-    confidence = confidence + when(has_district_boundary, lit(10)).otherwise(lit(0))
-    confidence = confidence + when(has_mukim_boundary, lit(10)).otherwise(lit(0))
-    confidence = confidence - when(has_state_boundary_conflict, lit(35)).otherwise(lit(0))
-    confidence = confidence - when(has_district_boundary_conflict, lit(35)).otherwise(lit(0))
-    confidence = confidence - when(has_mukim_boundary_conflict, lit(35)).otherwise(lit(0))
-    confidence = confidence - when(has_postcode_boundary_conflict, lit(35)).otherwise(lit(0))
-    confidence = confidence - when(state_conflict_postcode, lit(25)).otherwise(lit(0))
-    confidence = confidence - when(suspicious_locality_has_mukim, lit(20)).otherwise(lit(0))
-    confidence = confidence - when(suspicious_sub_has_street, lit(15)).otherwise(lit(0))
-    confidence = confidence - when(suspicious_sub_has_bandar, lit(10)).otherwise(lit(0))
-    confidence = confidence - when(suspicious_missing_street, lit(10)).otherwise(lit(0))
-
     df = df.withColumn(
         "confidence_score",
-        when(confidence < lit(0), lit(0))
-        .when(confidence > lit(100), lit(100))
-        .otherwise(confidence)
-        .cast("int"),
+        _CALCULATE_CONFIDENCE_UDF(
+            has_postcode.cast("boolean"),
+            has_state.cast("boolean"),
+            has_district.cast("boolean"),
+            has_mukim.cast("boolean"),
+            has_locality.cast("boolean"),
+            has_pbt.cast("boolean"),
+            has_postcode_boundary.cast("boolean"),
+            state_from_postcode.cast("boolean"),
+            state_from_locality.cast("boolean"),
+            (has_district & has_mukim).cast("boolean"),
+            (has_pbt & has_state).cast("boolean"),
+            has_state_boundary.cast("boolean"),
+            has_district_boundary.cast("boolean"),
+            has_mukim_boundary.cast("boolean"),
+            has_state_boundary_conflict.cast("boolean"),
+            has_district_boundary_conflict.cast("boolean"),
+            has_mukim_boundary_conflict.cast("boolean"),
+            has_postcode_boundary_conflict.cast("boolean"),
+            state_conflict_postcode.cast("boolean"),
+            suspicious_locality_has_mukim.cast("boolean"),
+            suspicious_sub_has_street.cast("boolean"),
+            suspicious_sub_has_bandar.cast("boolean"),
+            suspicious_missing_street.cast("boolean"),
+        ).cast("int"),
     )
     df = df.withColumn(
         "correction_notes",
@@ -1519,10 +2050,7 @@ def validate_addresses(
     df = df.withColumn("_dup_rank", row_number().over(window))
     df = df.withColumn(
         "confidence_band",
-        when(col("confidence_score") >= lit(95), lit("VERIFIED"))
-        .when(col("confidence_score") >= lit(85), lit("HIGH"))
-        .when(col("confidence_score") >= lit(70), lit("REVIEW"))
-        .otherwise(lit("REJECT")),
+        _CONFIDENCE_BAND_UDF(col("confidence_score").cast("int")),
     )
 
     reasons = array(

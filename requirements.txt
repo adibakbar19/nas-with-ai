@@ -1,7 +1,7 @@
-pyspark
+pyspark==4.0.1
 pandas
 openpyxl
-apache-sedona
+apache-sedona==1.8.1
 openai
 pyarrow
 requests

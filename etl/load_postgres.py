@@ -11,6 +11,7 @@ from pyspark.sql.functions import (
     current_timestamp,
     expr,
     regexp_extract,
+    regexp_replace,
     lit,
     lpad,
     monotonically_increasing_id,
@@ -23,8 +24,17 @@ from pyspark.sql.functions import (
     create_map,
 )
 
+from domain.replacements import (
+    LOCALITY_ABBREVIATION_REPLACEMENTS,
+    LOCALITY_INVALID_PREFIX_REGEX,
+    LOCALITY_PLACEHOLDER_VALUES,
+)
+
 from .audit_log import audit_event, start_audit_run
 from .sedona_utils import configure_sedona_builder, merge_spark_packages, resolve_sedona_spark_packages
+
+DEFAULT_PBT_DIR = os.path.join("data", "boundary", "Sempadan Kawalan PBT")
+LEGACY_PBT_DIR = os.path.join("data", "Sempadan Kawalan PBT")
 
 
 def _escape_sql_literal(value: str) -> str:
@@ -44,6 +54,16 @@ def _build_jdbc_url(args: argparse.Namespace) -> str:
     return f"jdbc:postgresql://{host}:{port}/{db}"
 
 
+def _normalize_locality_col(value_col):
+    out = upper(trim(value_col))
+    out = regexp_replace(out, r"\bR\s*&\s*R\b", "R&R")
+    out = regexp_replace(out, r"\bR\s+R\b", "R&R")
+    for src, dst in LOCALITY_ABBREVIATION_REPLACEMENTS:
+        out = regexp_replace(out, rf"\b{src}\b", dst)
+    out = regexp_replace(out, r"\s+", " ")
+    return trim(out)
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Load cleaned parquet data into Postgres.")
     parser.add_argument("--input", default="output/cleaned", help="Parquet folder or file")
@@ -51,10 +71,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--mode", default="append", choices=["append", "overwrite"], help="Write mode")
     parser.add_argument("--normalized", action="store_true", help="Load into ERD-style normalized tables")
     parser.add_argument("--lookups-dir", default="data/lookups", help="Lookups directory for codes")
-    parser.add_argument("--pbt-dir", default="data/Sempadan Kawalan PBT", help="PBT shapefiles directory")
+    parser.add_argument("--pbt-dir", default=DEFAULT_PBT_DIR, help="PBT shapefiles directory")
     parser.add_argument("--pbt-id-column", default="pbt_id", help="PBT ID column name in shapefile")
     parser.add_argument("--pbt-name-column", default="NAMA_PBT", help="PBT name column in shapefile")
     parser.add_argument("--schema", default=os.getenv("PGSCHEMA", "nas"), help="Target schema for normalized tables")
+    parser.add_argument(
+        "--allow-lookup-schema-overwrite",
+        action="store_true",
+        help="Allow writing normalized tables into LOOKUP_SCHEMA (disabled by default for safety).",
+    )
     parser.add_argument(
         "--naskod-suffix-max",
         type=int,
@@ -208,6 +233,29 @@ def _load_pbt_boundaries(spark: SparkSession, pbt_dir: str):
     return combined
 
 
+def _resolve_pbt_dir(pbt_dir: str | None) -> str | None:
+    candidates: list[str] = []
+    if pbt_dir:
+        candidates.append(pbt_dir)
+        if pbt_dir == LEGACY_PBT_DIR:
+            candidates.append(DEFAULT_PBT_DIR)
+        elif pbt_dir == DEFAULT_PBT_DIR:
+            candidates.append(LEGACY_PBT_DIR)
+    candidates.extend([DEFAULT_PBT_DIR, LEGACY_PBT_DIR])
+    seen: set[str] = set()
+    deduped: list[str] = []
+    for candidate in candidates:
+        normalized = os.path.normpath(candidate)
+        if normalized in seen:
+            continue
+        seen.add(normalized)
+        deduped.append(candidate)
+    for candidate in deduped:
+        if os.path.exists(candidate):
+            return candidate
+    return None
+
+
 def _build_normalized_tables(
     df,
     *,
@@ -302,9 +350,16 @@ def _build_normalized_tables(
     )
 
     locality_base = df.select(
-        upper(trim(col("locality_name"))).alias("locality_name"),
+        _normalize_locality_col(col("locality_name")).alias("locality_name"),
         col("mukim_id").cast("int").alias("mukim_id"),
-    ).filter(col("locality_name").isNotNull())
+    ).filter(
+        col("locality_name").isNotNull()
+        & (col("locality_name") != lit(""))
+        & col("locality_name").rlike("[A-Z]")
+        & (~col("locality_name").rlike(r"^\\d+[A-Z]?$"))
+        & (~col("locality_name").isin(*LOCALITY_PLACEHOLDER_VALUES))
+        & (~col("locality_name").rlike(LOCALITY_INVALID_PREFIX_REGEX))
+    )
     locality_table = locality_base.dropDuplicates(["locality_name", "mukim_id"])
     locality_table = locality_table.withColumn(
         "locality_id",
@@ -409,7 +464,7 @@ def _build_normalized_tables(
     street_base = df.select(
         col("street_name_prefix"),
         col("street_name"),
-        upper(trim(col("locality_name"))).alias("locality_name"),
+        _normalize_locality_col(col("locality_name")).alias("locality_name"),
         col("mukim_id").cast("int").alias("mukim_id"),
         when(col("pbt_id").rlike(r"^\\d+$"), col("pbt_id").cast("int")).alias("pbt_id"),
     ).filter(col("street_name").isNotNull())
@@ -429,7 +484,7 @@ def _build_normalized_tables(
     street_table = street_table.withColumn("updated_at", current_timestamp())
 
     # StandardizedAddress
-    addr = df.withColumn("locality_name", upper(trim(col("locality_name"))))
+    addr = df.withColumn("locality_name", _normalize_locality_col(col("locality_name")))
     addr = addr.withColumn(
         "pbt_id_int",
         when(col("pbt_id").rlike(r"^\\d+$"), col("pbt_id").cast("int")).otherwise(lit(None).cast("int")),
@@ -722,6 +777,12 @@ def main() -> None:
         )
         if args.normalized:
             schema = args.schema or ""
+            lookup_schema = (os.getenv("LOOKUP_SCHEMA", "nas_lookup") or "nas_lookup").strip()
+            if schema and lookup_schema and schema == lookup_schema and not args.allow_lookup_schema_overwrite:
+                raise ValueError(
+                    f"Refusing to write normalized ingest tables into lookup schema '{lookup_schema}'. "
+                    "Use a different --schema or pass --allow-lookup-schema-overwrite intentionally."
+                )
             schema_for_check = schema or "public"
             schema_qual = f"{schema}." if schema else ""
             if schema:
@@ -733,12 +794,22 @@ def main() -> None:
                     [f"CREATE SCHEMA IF NOT EXISTS {schema};"],
                 )
             pbt_boundaries = None
-            if args.pbt_dir and os.path.exists(args.pbt_dir):
+            resolved_pbt_dir = _resolve_pbt_dir(args.pbt_dir)
+            if resolved_pbt_dir:
                 try:
                     from .sedona_utils import register_sedona
 
                     register_sedona(spark)
-                    pbt_boundaries = _load_pbt_boundaries(spark, args.pbt_dir)
+                    pbt_boundaries = _load_pbt_boundaries(spark, resolved_pbt_dir)
+                    if resolved_pbt_dir != args.pbt_dir:
+                        audit_event(
+                            args.audit_log,
+                            "load_postgres",
+                            run_id,
+                            "pbt_dir_resolved",
+                            requested_pbt_dir=args.pbt_dir,
+                            resolved_pbt_dir=resolved_pbt_dir,
+                        )
                 except Exception as exc:
                     audit_event(
                         args.audit_log,
@@ -748,6 +819,15 @@ def main() -> None:
                         warning=str(exc),
                     )
                     print(f"Warning: failed to load PBT boundaries: {exc}")
+            else:
+                audit_event(
+                    args.audit_log,
+                    "load_postgres",
+                    run_id,
+                    "pbt_boundary_warning",
+                    warning="PBT directory not found; fallback to source pbt_id/pbt_name values",
+                    requested_pbt_dir=args.pbt_dir,
+                )
 
             tables = _build_normalized_tables(
                 df,
@@ -757,6 +837,47 @@ def main() -> None:
                 pbt_id_column=args.pbt_id_column,
                 pbt_name_column=args.pbt_name_column,
             )
+            source_locality_count = (
+                df.select(trim(col("locality_name")).alias("_locality_name"))
+                .filter(col("_locality_name").isNotNull() & (col("_locality_name") != lit("")))
+                .count()
+            )
+            source_pbt_count = (
+                df.select(
+                    trim(col("pbt_id").cast("string")).alias("_pbt_id"),
+                    trim(col("pbt_name")).alias("_pbt_name"),
+                )
+                .filter(
+                    (col("_pbt_id").isNotNull() & (col("_pbt_id") != lit("")))
+                    | (col("_pbt_name").isNotNull() & (col("_pbt_name") != lit("")))
+                )
+                .count()
+            )
+            locality_count = tables["locality"].count()
+            pbt_count = tables["pbt"].count()
+            audit_event(
+                args.audit_log,
+                "load_postgres",
+                run_id,
+                "normalized_dimension_counts",
+                locality_count=locality_count,
+                pbt_count=pbt_count,
+                source_locality_count=source_locality_count,
+                source_pbt_count=source_pbt_count,
+                pbt_dir=(resolved_pbt_dir or args.pbt_dir),
+                pbt_from_boundaries=bool(pbt_boundaries is not None),
+            )
+            if locality_count == 0 or pbt_count == 0:
+                audit_event(
+                    args.audit_log,
+                    "load_postgres",
+                    run_id,
+                    "dimension_empty_warning",
+                    locality_count=locality_count,
+                    pbt_count=pbt_count,
+                    source_locality_count=source_locality_count,
+                    source_pbt_count=source_pbt_count,
+                )
             dim_mode = "overwrite"
             _write_table(tables["state"], jdbc_url=jdbc_url, table=f"{schema_qual}state", mode=dim_mode, props=props)
             _write_table(

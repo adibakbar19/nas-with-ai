@@ -220,7 +220,7 @@ if [ "${SKIP_LOAD}" != "1" ]; then
     --table standardized_address \
     --mode overwrite \
     --normalized \
-    --pbt-dir "data/Sempadan Kawalan PBT"
+    --pbt-dir "data/boundary/Sempadan Kawalan PBT"
 else
   echo "Skipping Postgres load (SKIP_LOAD=${SKIP_LOAD})."
 fi

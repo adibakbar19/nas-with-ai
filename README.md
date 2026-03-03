@@ -8,6 +8,7 @@ Quick runbook: see `docs/RUN_PIPELINE.md`.
 ```text
 etl/        core data pipeline package
 backend/    FastAPI backend
+domain/     shared pure business rules (API/ETL/worker)
 frontend/   legacy static UI
 frontend-vue/ Vue 3 app (separate deploy)
 config/     pipeline configs
@@ -147,6 +148,7 @@ Flow notes:
 
 ## Files
 - `etl/`: core ETL package (`extract`, `transform`, `pipeline`, loaders, lookup matching, audit helpers).
+- `domain/`: pure domain module (`models`, `normalization`, `scoring`, `validation`, `exceptions`).
 - `pipeline.py`: thin entrypoint wrapper to `etl.pipeline`.
 - `load_postgres.py`: thin entrypoint wrapper to `etl.load_postgres`.
 - `load_elasticsearch.py`: thin entrypoint wrapper to `etl.load_elasticsearch`.
@@ -155,9 +157,8 @@ Flow notes:
 - `retry_failed.py`: thin entrypoint wrapper to `etl.retry_failed`.
 - `validate_env.py`: thin entrypoint wrapper to `etl.validate_env`.
 - `backend/app/main.py`: FastAPI backend (`/api/v1/health`, `/api/v1/search/autocomplete`, `/api/v1/jobs`).
-- `backend/app/services/address_service.py`: business logic layer.
-- `backend/app/repositories/address_repository.py`: PostgreSQL/PostGIS repository layer.
-- `backend/app/search/elasticsearch_gateway.py`: Elasticsearch integration layer.
+- `backend/app/services/ingest_service.py`: ingest orchestration service layer.
+- `backend/app/services/address_read_service.py`: database read service layer for Postgres lookup endpoints.
 - `backend/app/queue/producer.py`: async queue producer abstraction + SQS/log implementations.
 - `backend/app/workers/queue_consumer.py`: async worker consumer example.
 - `frontend/`: legacy static UI.
@@ -392,10 +393,16 @@ Use a JSON config to customize which columns are treated as old/new addresses an
     "address_type": ["building_type"]
   },
   "pbt_enabled": true,
-  "pbt_dir": "data/Sempadan Kawalan PBT",
+  "pbt_dir": "data/boundary/Sempadan Kawalan PBT",
   "pbt_id_column": "pbt_id",
   "pbt_name_column": "NAMA_PBT",
   "pbt_simplify_tolerance": 0.00005,
+  "boundary_source": "db",
+  "boundary_db_schema": "nas_lookup",
+  "state_boundary_table": "state_boundary",
+  "district_boundary_table": "district_boundary",
+  "mukim_boundary_table": "mukim_boundary",
+  "postcode_boundary_table": "postcode_boundary",
   "admin_boundary_enabled": true,
   "state_boundary_dir": "data/boundary/01_State_boundary",
   "postcode_boundary_enabled": true,
@@ -406,7 +413,12 @@ Use a JSON config to customize which columns are treated as old/new addresses an
   "postcode_boundary_simplify_tolerance": 0.00005,
   "district_boundary_dir": "data/boundary/03_District_boundary",
   "mukim_boundary_dir": "data/boundary/05_Mukim_boundary",
-  "admin_boundary_simplify_tolerance": 0.00005
+  "admin_boundary_simplify_tolerance": 0.00005,
+  "lookup_source": "db",
+  "lookup_db_schema": "nas_lookup",
+  "lookup_cache_enabled": true,
+  "lookup_memory_cache_enabled": true,
+  "lookup_cache_dir": "output/lookups_cache"
 }
 ```
 
@@ -437,12 +449,32 @@ You can also define text replacements to normalize common address terms:
 export $(cat .env | xargs)
 export SPARK_JARS_PACKAGES="org.apache.sedona:sedona-spark-shaded-4.0_2.13:1.8.1,org.datasyslab:geotools-wrapper:1.8.1-33.1,org.postgresql:postgresql:42.7.3"
 venv/bin/python load_postgres.py --input output/cleaned --mode overwrite --normalized
-# This will also load PBT boundaries (if available in data/Sempadan Kawalan PBT),
+# This will also load PBT boundaries (if available in data/boundary/Sempadan Kawalan PBT),
 # convert `geom` and `pbt.boundary_geom` into PostGIS geometry, and add GiST indexes.
 #
 # Note: tables are created under schema `nas` by default (PGSCHEMA=nas) to avoid
 # conflicts with PostGIS Tiger geocoder's `public.state` table.
 ```
+
+Spark/Sedona compatibility:
+- Use `pyspark==4.0.x` with Sedona `1.8.1` for the default setup.
+- Spark `4.1.x` may run with reduced Sedona compatibility.
+
+## Bootstrap Lookup Tables To DB
+Build canonical lookup tables from master files and write them into Postgres:
+```bash
+venv/bin/python bootstrap_lookups.py \
+  --lookups-dir data/lookups \
+  --granite-root data/granite_map_info-master \
+  --locality-lookup data/lookups/locality_lookup.csv \
+  --rebuild-locality-lookup \
+  --schema nas_lookup
+```
+
+Then switch ETL lookup + boundary mode in `config/config.json`:
+- `"lookup_source": "db"`
+- `"boundary_source": "db"`
+- keep `"lookup_cache_enabled": true` for versioned parquet cache reuse.
 
 ## NASKod (Standard + Vanity)
 Standard format:

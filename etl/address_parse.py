@@ -14,9 +14,21 @@ from pyspark.sql.functions import (
     regexp_replace,
     split,
     trim,
+    udf,
     upper,
     when,
 )
+from pyspark.sql.types import StringType
+
+from domain.normalization import normalize_address_text
+
+
+def _domain_normalize_address(value: str | None) -> str | None:
+    normalized = normalize_address_text(value, uppercase=True)
+    return normalized or None
+
+
+_DOMAIN_NORMALIZE_ADDRESS_UDF = udf(_domain_normalize_address, StringType())
 
 
 def normalize_for_match(address_col):
@@ -35,7 +47,9 @@ def normalize_segment(seg_col):
 
 
 def parse_full_address(df: DataFrame, address_col: str, replacements: Optional[dict] = None) -> DataFrame:
-    address_clean = trim(regexp_replace(col(address_col).cast("string"), r"\s+", " "))
+    # Row-level domain normalization keeps API/ETL behavior aligned.
+    address_clean = _DOMAIN_NORMALIZE_ADDRESS_UDF(col(address_col).cast("string"))
+    address_clean = trim(regexp_replace(address_clean, r"\s+", " "))
     address_clean = regexp_replace(address_clean, r"[;|]+", ",")
     if replacements:
         for src, dst in replacements.items():

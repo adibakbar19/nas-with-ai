@@ -42,6 +42,33 @@ Behavior:
   - failed parquet to `output/failed`
 - Skips Elasticsearch by default (`SKIP_ES=1`)
 
+## 3.1) Bootstrap DB Lookup Tables (Recommended)
+
+Build `state`, `district`, `mukim`, `locality`, `postcode`, `pbt` plus boundary tables
+(`state_boundary`, `district_boundary`, `mukim_boundary`, `postcode_boundary`) from master datasets.
+This also rebuilds:
+- `data/lookups/locality_lookup.csv` from Granite `CITY` (locality)
+- `data/lookups/sublocality_lookup.csv` from Granite `SECTION` (sub-locality)
+
+```bash
+venv/bin/python bootstrap_lookups.py \
+  --lookups-dir data/lookups \
+  --granite-root data/granite_map_info-master \
+  --locality-lookup data/lookups/locality_lookup.csv \
+  --rebuild-locality-lookup \
+  --schema nas_lookup
+```
+
+This also writes `nas.lookup_version`, used by Spark lookup cache invalidation.
+
+To make ETL use DB lookups + DB boundaries + cache, set in `config/config.json`:
+- `"lookup_source": "db"`
+- `"lookup_db_schema": "nas_lookup"`
+- `"boundary_source": "db"`
+- `"boundary_db_schema": "nas_lookup"`
+- `"lookup_cache_enabled": true`
+- `"lookup_cache_dir": "output/lookups_cache"`
+
 ## 4) Fast Development Run
 
 ```bash
@@ -149,6 +176,8 @@ SKIP_LOAD=0 bash run_all.sh
 ```
 
 This runs `load_postgres.py` and writes normalized tables to schema `nas`.
+
+Safety: `load_postgres.py` refuses to write into `LOOKUP_SCHEMA` (default `nas_lookup`) unless `--allow-lookup-schema-overwrite` is explicitly passed.
 
 ## 9) Optional Elasticsearch Load
 

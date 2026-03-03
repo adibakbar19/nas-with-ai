@@ -1,7 +1,9 @@
+import hashlib
 import threading
 import uuid
-from datetime import datetime, timezone
 from typing import Any, BinaryIO
+
+from minio.error import S3Error
 
 from backend.app.services.errors import ServiceError
 
@@ -32,22 +34,28 @@ class IngestService:
         resume_failed_only = True
         config_path = "config/config.json"
         source_type = runtime._infer_source_type(file_name)
+        content_sha256, content_bytes = self._hash_file(file_obj)
         job_id = uuid.uuid4().hex
-        object_name = f"{datetime.now(timezone.utc).strftime('%Y/%m/%d')}/{job_id}_{file_name}"
+        object_name = f"sha256/{content_sha256}"
         success_path = runtime.OUTPUT_UPLOADS_DIR / job_id / "cleaned"
         failed_path = runtime.OUTPUT_UPLOADS_DIR / job_id / "failed"
         checkpoint_root = runtime.OUTPUT_UPLOADS_DIR / job_id / "checkpoints"
+        uploaded_new_object = False
 
         try:
             client = runtime._get_minio_client()
-            client.put_object(
-                runtime.MINIO_BUCKET,
-                object_name,
-                file_obj,
-                length=-1,
-                part_size=10 * 1024 * 1024,
-                content_type=content_type or "application/octet-stream",
-            )
+            object_exists = self._object_exists(client, runtime.MINIO_BUCKET, object_name)
+            if not object_exists:
+                self._rewind_file(file_obj)
+                client.put_object(
+                    runtime.MINIO_BUCKET,
+                    object_name,
+                    file_obj,
+                    length=content_bytes,
+                    part_size=10 * 1024 * 1024,
+                    content_type=content_type or "application/octet-stream",
+                )
+                uploaded_new_object = True
         except Exception as exc:
             raise ServiceError(status_code=502, detail=f"minio upload failed: {exc}") from exc
 
@@ -60,6 +68,9 @@ class IngestService:
             config_path=config_path,
             object_name=object_name,
             bucket=runtime.MINIO_BUCKET,
+            content_sha256=content_sha256,
+            content_bytes=content_bytes,
+            object_reused=not uploaded_new_object,
             success_path=str(success_path),
             failed_path=str(failed_path),
             checkpoint_root=str(checkpoint_root),
@@ -77,6 +88,9 @@ class IngestService:
             "job_id": job_id,
             "status": "queued" if auto_start else "uploaded",
             "object_name": object_name,
+            "content_sha256": content_sha256,
+            "content_bytes": content_bytes,
+            "object_reused": not uploaded_new_object,
             "load_to_db": load_to_db,
         }
 
@@ -211,3 +225,35 @@ class IngestService:
     def run_job(self, job_id: str) -> None:
         runtime = self._runtime()
         runtime._run_ingest_job(job_id)
+
+    @staticmethod
+    def _rewind_file(file_obj: BinaryIO) -> None:
+        if not hasattr(file_obj, "seek"):
+            raise RuntimeError("uploaded file stream is not seekable")
+        file_obj.seek(0)
+
+    @classmethod
+    def _hash_file(cls, file_obj: BinaryIO) -> tuple[str, int]:
+        cls._rewind_file(file_obj)
+        hasher = hashlib.sha256()
+        total_bytes = 0
+        while True:
+            chunk = file_obj.read(1024 * 1024)
+            if not chunk:
+                break
+            if isinstance(chunk, str):
+                chunk = chunk.encode("utf-8")
+            hasher.update(chunk)
+            total_bytes += len(chunk)
+        cls._rewind_file(file_obj)
+        return hasher.hexdigest(), total_bytes
+
+    @staticmethod
+    def _object_exists(client, bucket: str, object_name: str) -> bool:
+        try:
+            client.stat_object(bucket, object_name)
+            return True
+        except S3Error as exc:
+            if exc.code in {"NoSuchKey", "NoSuchObject", "NoSuchBucket", "NotFound"}:
+                return False
+            raise

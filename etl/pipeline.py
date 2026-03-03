@@ -1,4 +1,5 @@
 import argparse
+import json
 import os
 import time
 
@@ -19,7 +20,7 @@ from .audit_log import audit_event, start_audit_run
 from .extract import extract_data
 from .load import load_parquet, load_success_failed
 from .naskod_utils import add_standard_naskod
-from .sedona_utils import configure_sedona_builder, resolve_sedona_spark_packages
+from .sedona_utils import configure_sedona_builder, merge_spark_packages, resolve_sedona_spark_packages
 from .transform import clean_addresses, validate_addresses
 
 
@@ -137,6 +138,17 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def _lookup_source_from_config(config_path: str | None) -> str:
+    if not config_path or not os.path.exists(config_path):
+        return "files"
+    try:
+        with open(config_path, "r", encoding="utf-8") as handle:
+            config = json.load(handle)
+    except (OSError, json.JSONDecodeError):
+        return "files"
+    return str(config.get("lookup_source", "files")).strip().lower()
+
+
 def main():
     args = parse_args()
     started = time.time()
@@ -162,6 +174,8 @@ def main():
             builder = builder.config("spark.sql.shuffle.partitions", spark_shuffle_partitions)
         builder = configure_sedona_builder(builder)
         jars_packages = resolve_sedona_spark_packages()
+        if _lookup_source_from_config(args.config) == "db":
+            jars_packages = merge_spark_packages(jars_packages, "org.postgresql:postgresql:42.7.3")
         if jars_packages:
             builder = builder.config("spark.jars.packages", jars_packages)
         spark = builder.getOrCreate()
@@ -173,6 +187,7 @@ def main():
         status_path = args.status_path or f"{checkpoint_root.rstrip('/')}/90_record_status"
 
         stage_extract = f"{checkpoint_root.rstrip('/')}/10_extract_raw"
+        stage_extract_resume_filtered = f"{checkpoint_root.rstrip('/')}/11_extract_resume_filtered"
         stage_clean = f"{checkpoint_root.rstrip('/')}/20_clean"
         stage_success = f"{checkpoint_root.rstrip('/')}/30_validated_success"
         stage_failed = f"{checkpoint_root.rstrip('/')}/31_validated_failed"
@@ -257,6 +272,10 @@ def main():
                 before_count=before_count,
                 after_count=after_count,
             )
+            # Break lineage from status parquet before status table overwrite to avoid
+            # stale file handles during later stages (common in resume-failed-only mode).
+            _write_stage_df(df_raw, stage_extract_resume_filtered)
+            df_raw = _read_stage_df(spark, stage_extract_resume_filtered)
 
         _upsert_status(
             spark,

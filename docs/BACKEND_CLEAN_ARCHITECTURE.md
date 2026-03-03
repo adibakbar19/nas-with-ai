@@ -4,9 +4,10 @@ Runtime API is unified under `backend/app/main.py` to avoid duplicate surfaces i
 
 Core modules still follow layered separation:
 
-- Service layer: `backend/app/services/address_service.py`
-- Repository layer: `backend/app/repositories/address_repository.py`
-- Search gateway: `backend/app/search/elasticsearch_gateway.py`
+- Shared domain (pure Python, reusable in API/ETL/worker): `domain/`
+- Ingest orchestration service: `backend/app/services/ingest_service.py`
+- Ops/Search API services: `backend/app/services/ops_service.py`, `backend/app/services/search_api_service.py`
+- DB read service + repository: `backend/app/services/address_read_service.py`, `backend/app/repositories/address_read_repository.py`
 - Queue producer: `backend/app/queue/producer.py`
 - Worker consumer: `backend/app/workers/queue_consumer.py`
 - Dependency wiring: `backend/app/dependencies.py`
@@ -47,3 +48,9 @@ When `INGEST_EXECUTION_MODE=queue_worker`:
 
 - `psycopg[binary]` for PostgreSQL/PostGIS repository access.
 - `boto3` for SQS producer/consumer.
+
+## Domain Reuse
+
+- API and worker services call shared rules from `domain/` for normalization/scoring/validation.
+- ETL uses the same domain logic for row-level address normalization and confidence scoring via Spark UDF wrappers.
+- `domain/` has no FastAPI/Spark/DB/queue imports.

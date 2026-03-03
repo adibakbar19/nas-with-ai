@@ -561,7 +561,7 @@ def _run_ingest_job(job_id: str) -> None:
                     "--mode",
                     "append",
                     "--pbt-dir",
-                    "data/Sempadan Kawalan PBT",
+                    "data/boundary/Sempadan Kawalan PBT",
                 ]
                 load_env = os.environ.copy()
                 load_env.setdefault("SPARK_LOCAL_IP", "127.0.0.1")
@@ -841,9 +841,11 @@ def _load_audit_runs(limit: int) -> list[dict[str, Any]]:
 
 
 from backend.app.api.v1.ingest import router as ingest_router
+from backend.app.api.v1.address_db import router as address_db_router
 from backend.app.api.v1.ops import router as ops_router
 from backend.app.api.v1.search import router as search_router
 
 app.include_router(ops_router)
 app.include_router(search_router)
+app.include_router(address_db_router)
 app.include_router(ingest_router)

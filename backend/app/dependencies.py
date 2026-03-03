@@ -2,33 +2,22 @@ from functools import lru_cache
 
 from backend.app.core.settings import AppSettings, get_settings
 from backend.app.queue.producer import LoggingQueueProducer, QueueProducer, SQSQueueProducer
-from backend.app.repositories.address_repository import PostgresAddressRepository
-from backend.app.search.elasticsearch_gateway import ElasticsearchSearchGateway
-from backend.app.services.address_service import AddressService
+from backend.app.repositories.address_read_repository import AddressReadRepository
+from backend.app.services.address_read_service import AddressReadService
 from backend.app.services.ingest_service import IngestService
 from backend.app.services.ops_service import OpsService
 from backend.app.services.search_api_service import SearchApiService
 
 
 @lru_cache(maxsize=1)
-def get_search_gateway() -> ElasticsearchSearchGateway:
+def get_address_read_repository() -> AddressReadRepository:
     settings = get_settings()
-    return ElasticsearchSearchGateway(es_url=settings.es_url, index=settings.es_index)
+    return AddressReadRepository(dsn=settings.postgres_dsn, schema=settings.postgres_schema)
 
 
 @lru_cache(maxsize=1)
-def get_repository() -> PostgresAddressRepository:
-    settings = get_settings()
-    return PostgresAddressRepository(
-        dsn=settings.postgres_dsn,
-        schema=settings.postgres_schema,
-        postcode_boundary_table=settings.postcode_boundary_table,
-    )
-
-
-@lru_cache(maxsize=1)
-def get_address_service() -> AddressService:
-    return AddressService(repository=get_repository(), search_gateway=get_search_gateway())
+def get_address_read_service() -> AddressReadService:
+    return AddressReadService(repository=get_address_read_repository())
 
 
 @lru_cache(maxsize=1)
