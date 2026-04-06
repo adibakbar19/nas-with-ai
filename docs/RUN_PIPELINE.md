@@ -223,7 +223,7 @@ Useful env vars:
   - Reduce workload (FAST mode / smaller input)
   - Move full run to larger cloud machine for production workloads.
 
-## 11) Start MinIO For Upload Feature
+## 11) Start Local MinIO For Upload Feature
 
 ```bash
 docker compose up -d minio
@@ -242,6 +242,8 @@ Start API:
 uvicorn backend.app.main:app --host 0.0.0.0 --port 8000 --reload
 ```
 
+AWS S3 deployments can skip MinIO entirely and point the backend to S3 with `OBJECT_STORE_BUCKET` plus AWS credentials or IAM.
+
 Start worker (required when `INGEST_EXECUTION_MODE=queue_worker`):
 
 ```bash
@@ -259,7 +261,7 @@ This waits for Postgres, checks whether `nas_lookup.lookup_version` already exis
 
 Upload flow:
 - Upload CSV/JSON/Excel from a client.
-- Backend stores it in MinIO.
+- Backend stores it in the configured object storage bucket.
 - Backend writes ingest event to queue (`QUEUE_BACKEND`).
 - Worker consumes event and runs `pipeline.py`.
 - Output:

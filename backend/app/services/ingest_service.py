@@ -4,10 +4,9 @@ import threading
 import uuid
 from typing import Any, BinaryIO
 
-from minio.error import S3Error
-
 from backend.app.repositories.multipart_upload_repository import MultipartUploadRepository
 from backend.app.services.errors import ServiceError
+from object_store import build_s3_client, is_missing_object_error
 
 
 class IngestService:
@@ -36,10 +35,17 @@ class IngestService:
         return max(300, int(os.getenv("INGEST_MULTIPART_PRESIGN_EXPIRES_SECONDS", "3600")))
 
     @staticmethod
-    def _minio_public_endpoint() -> str:
+    def _object_store_public_endpoint() -> str:
         runtime = IngestService._runtime()
-        endpoint = os.getenv("MINIO_PUBLIC_ENDPOINT", "").strip() or runtime.MINIO_ENDPOINT
-        secure = os.getenv("MINIO_PUBLIC_SECURE", str(runtime.MINIO_SECURE)).lower() in {"1", "true", "yes", "y"}
+        endpoint = os.getenv("OBJECT_STORE_PUBLIC_ENDPOINT", "").strip() or runtime.OBJECT_STORE_PUBLIC_ENDPOINT
+        if not endpoint:
+            return ""
+        secure = os.getenv("OBJECT_STORE_PUBLIC_SECURE", str(runtime.OBJECT_STORE_SECURE)).lower() in {
+            "1",
+            "true",
+            "yes",
+            "y",
+        }
         if endpoint.startswith("http://") or endpoint.startswith("https://"):
             return endpoint
         scheme = "https" if secure else "http"
@@ -48,29 +54,18 @@ class IngestService:
     @classmethod
     def _get_s3_client(cls, *, public_endpoint: bool):
         runtime = cls._runtime()
-        try:
-            import boto3
-            from botocore.client import Config
-        except Exception as exc:  # pragma: no cover - dependency provided in runtime image
-            raise RuntimeError("boto3 is required for multipart browser uploads") from exc
-
-        endpoint_url = cls._minio_public_endpoint() if public_endpoint else (
-            runtime.MINIO_ENDPOINT
-            if runtime.MINIO_ENDPOINT.startswith("http://") or runtime.MINIO_ENDPOINT.startswith("https://")
-            else f"{'https' if runtime.MINIO_SECURE else 'http'}://{runtime.MINIO_ENDPOINT}"
-        )
-        return boto3.client(
-            "s3",
-            endpoint_url=endpoint_url,
-            aws_access_key_id=runtime.MINIO_ACCESS_KEY,
-            aws_secret_access_key=runtime.MINIO_SECRET_KEY,
-            region_name=os.getenv("AWS_REGION", "us-east-1"),
-            config=Config(signature_version="s3v4", s3={"addressing_style": "path"}),
-        )
+        return build_s3_client(runtime.OBJECT_STORE, public=public_endpoint)
 
     @classmethod
     def _ensure_bucket_cors(cls) -> None:
         runtime = cls._runtime()
+        manage_cors = os.getenv("OBJECT_STORE_MANAGE_CORS", "").strip().lower()
+        if not manage_cors:
+            manage_cors_enabled = bool(runtime.OBJECT_STORE.endpoint)
+        else:
+            manage_cors_enabled = manage_cors in {"1", "true", "yes", "y", "on"}
+        if not manage_cors_enabled:
+            return
         s3_client = cls._get_s3_client(public_endpoint=False)
         allowed_origins = sorted(
             {
@@ -81,7 +76,7 @@ class IngestService:
         ) or ["*"]
         try:
             s3_client.put_bucket_cors(
-                Bucket=runtime.MINIO_BUCKET,
+                Bucket=runtime.OBJECT_STORE_BUCKET,
                 CORSConfiguration={
                     "CORSRules": [
                         {
@@ -180,26 +175,25 @@ class IngestService:
         uploaded_new_object = False
 
         try:
-            client = runtime._get_minio_client()
-            object_exists = self._object_exists(client, runtime.MINIO_BUCKET, object_name)
+            client = runtime._get_object_store_client()
+            object_exists = self._object_exists(client, runtime.OBJECT_STORE_BUCKET, object_name)
             if not object_exists:
                 self._rewind_file(file_obj)
                 client.put_object(
-                    runtime.MINIO_BUCKET,
-                    object_name,
-                    file_obj,
-                    length=content_bytes,
-                    part_size=10 * 1024 * 1024,
-                    content_type=content_type or "application/octet-stream",
+                    Bucket=runtime.OBJECT_STORE_BUCKET,
+                    Key=object_name,
+                    Body=file_obj,
+                    ContentLength=content_bytes,
+                    ContentType=content_type or "application/octet-stream",
                 )
                 uploaded_new_object = True
         except Exception as exc:
-            raise ServiceError(status_code=502, detail=f"minio upload failed: {exc}") from exc
+            raise ServiceError(status_code=502, detail=f"object storage upload failed: {exc}") from exc
 
         return self._register_uploaded_object(
             file_name=file_name,
             object_name=object_name,
-            bucket=runtime.MINIO_BUCKET,
+            bucket=runtime.OBJECT_STORE_BUCKET,
             content_bytes=content_bytes,
             auto_start=auto_start,
             content_sha256=content_sha256,
@@ -232,7 +226,7 @@ class IngestService:
             self._ensure_bucket_cors()
             s3_client = self._get_s3_client(public_endpoint=False)
             response = s3_client.create_multipart_upload(
-                Bucket=runtime.MINIO_BUCKET,
+                Bucket=runtime.OBJECT_STORE_BUCKET,
                 Key=object_name,
                 ContentType=content_type or "application/octet-stream",
             )
@@ -243,7 +237,7 @@ class IngestService:
         session = {
             "session_id": session_id,
             "status": "initiated",
-            "bucket": runtime.MINIO_BUCKET,
+            "bucket": runtime.OBJECT_STORE_BUCKET,
             "object_name": object_name,
             "upload_id": upload_id,
             "file_name": file_name,
@@ -259,7 +253,7 @@ class IngestService:
         self._multipart_repository().create_session(session=session)
         return {
             "session_id": session_id,
-            "bucket": runtime.MINIO_BUCKET,
+            "bucket": runtime.OBJECT_STORE_BUCKET,
             "object_name": object_name,
             "upload_id": upload_id,
             "part_size": part_size,
@@ -551,9 +545,9 @@ class IngestService:
     @staticmethod
     def _object_exists(client, bucket: str, object_name: str) -> bool:
         try:
-            client.stat_object(bucket, object_name)
+            client.head_object(Bucket=bucket, Key=object_name)
             return True
-        except S3Error as exc:
-            if exc.code in {"NoSuchKey", "NoSuchObject", "NoSuchBucket", "NotFound"}:
+        except Exception as exc:
+            if is_missing_object_error(exc):
                 return False
             raise

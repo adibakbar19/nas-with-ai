@@ -20,6 +20,8 @@ from pyspark.sql.functions import (
     when,
 )
 
+from object_store import ObjectStoreSettings, build_s3_client, ensure_bucket_exists
+
 from .audit_log import audit_event, start_audit_run
 from .extract import extract_data
 from .load import load_parquet, load_success_failed
@@ -155,14 +157,14 @@ def _derive_job_id(checkpoint_root: str, success_path: str) -> str:
     return "unknown_job"
 
 
-def _maybe_sync_checkpoint_to_minio(
+def _maybe_sync_checkpoint_to_object_store(
     stage_path: str,
     *,
     stage: str,
     checkpoint_root: str,
     job_id: str,
 ) -> None:
-    if os.getenv("CHECKPOINT_STORE", "local").strip().lower() != "minio":
+    if os.getenv("CHECKPOINT_STORE", "local").strip().lower() not in {"s3", "minio"}:
         return
     if not stage_path.startswith(checkpoint_root.rstrip("/") + "/") and stage_path.rstrip("/") != checkpoint_root.rstrip("/"):
         return
@@ -172,33 +174,34 @@ def _maybe_sync_checkpoint_to_minio(
         _stage_log(stage, "sync_skip", reason="non_local_stage_path", stage_path=stage_path)
         return
 
-    endpoint = os.getenv("MINIO_ENDPOINT", "").strip()
-    access_key = os.getenv("MINIO_ACCESS_KEY", "").strip()
-    secret_key = os.getenv("MINIO_SECRET_KEY", "").strip()
-    bucket = os.getenv("CHECKPOINT_MINIO_BUCKET", "nas-checkpoints").strip() or "nas-checkpoints"
-    secure = os.getenv("MINIO_SECURE", "false").strip().lower() in {"1", "true", "yes", "y"}
-    if not endpoint or not access_key or not secret_key:
-        _stage_log(stage, "sync_skip", reason="minio_env_missing")
-        return
+    settings = ObjectStoreSettings.from_env()
+    bucket = os.getenv("CHECKPOINT_OBJECT_STORE_BUCKET", "").strip() or os.getenv("CHECKPOINT_MINIO_BUCKET", "").strip()
+    if bucket:
+        settings = ObjectStoreSettings(
+            bucket=bucket,
+            region=settings.region,
+            endpoint=settings.endpoint,
+            public_endpoint=settings.public_endpoint,
+            access_key_id=settings.access_key_id,
+            secret_access_key=settings.secret_access_key,
+            session_token=settings.session_token,
+            secure=settings.secure,
+            public_secure=settings.public_secure,
+            use_path_style=settings.use_path_style,
+            auto_create_bucket=settings.auto_create_bucket,
+        )
 
     try:
-        from minio import Minio  # type: ignore
-    except Exception as exc:
-        _stage_log(stage, "sync_skip", reason=f"minio_import_failed:{exc}")
-        return
-
-    try:
-        client = Minio(endpoint, access_key=access_key, secret_key=secret_key, secure=secure)
-        if not client.bucket_exists(bucket):
-            client.make_bucket(bucket)
+        client = build_s3_client(settings)
+        ensure_bucket_exists(client, settings)
         prefix = f"{job_id}/{os.path.basename(stage_path.rstrip('/'))}"
         for root, _, files in os.walk(local_stage):
             for name in files:
                 local_file = os.path.join(root, name)
                 rel = os.path.relpath(local_file, local_stage).replace(os.sep, "/")
                 object_name = f"{prefix}/{rel}"
-                client.fput_object(bucket, object_name, local_file)
-        _stage_log(stage, "sync_done", bucket=bucket, prefix=prefix)
+                client.upload_file(local_file, settings.bucket, object_name)
+        _stage_log(stage, "sync_done", bucket=settings.bucket, prefix=prefix)
     except Exception as exc:
         _stage_log(stage, "sync_failed", error=exc)
 
@@ -235,7 +238,7 @@ def _write_stage_df(
         f"{stage_path.rstrip('/')}/_stage_metadata/metadata.json",
         content=json.dumps(metadata, ensure_ascii=True),
     )
-    _maybe_sync_checkpoint_to_minio(
+    _maybe_sync_checkpoint_to_object_store(
         stage_path,
         stage=stage,
         checkpoint_root=checkpoint_root,

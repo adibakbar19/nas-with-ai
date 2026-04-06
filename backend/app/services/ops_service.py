@@ -13,7 +13,7 @@ class OpsService:
     def health(self) -> dict[str, Any]:
         runtime = self._runtime()
         es_status = "down"
-        minio_status = "down"
+        object_storage_status = "down"
         try:
             response = runtime.requests.get(runtime.ES_URL, timeout=5)
             if response.status_code < 300:
@@ -21,15 +21,16 @@ class OpsService:
         except runtime.requests.RequestException:
             es_status = "down"
         try:
-            runtime._get_minio_client()
-            minio_status = "up"
+            runtime._get_object_store_client()
+            object_storage_status = "up"
         except Exception:
-            minio_status = "down"
+            object_storage_status = "down"
         return {
             "service": "nas-api",
             "status": "ok",
             "elasticsearch": es_status,
-            "minio": minio_status,
+            "object_storage": object_storage_status,
+            "minio": object_storage_status,
             "ingest_execution_mode": runtime.INGEST_EXECUTION_MODE,
         }
 

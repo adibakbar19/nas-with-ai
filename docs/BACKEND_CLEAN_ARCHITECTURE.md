@@ -19,6 +19,13 @@ Core modules still follow layered separation:
 - `PGHOST`, `PGPORT`, `PGDATABASE`, `PGUSER`, `PGPASSWORD`, `PGSCHEMA`
 - `POSTCODE_BOUNDARY_TABLE` (default `postcode_boundary`)
 - `ES_URL`, `ES_INDEX`
+- `OBJECT_STORE_BUCKET`
+- `OBJECT_STORE_ENDPOINT` (optional; leave empty for AWS S3)
+- `OBJECT_STORE_PUBLIC_ENDPOINT` (optional; used for browser multipart uploads)
+- `OBJECT_STORE_USE_PATH_STYLE` (typically `false` for AWS S3, `true` for MinIO)
+- `OBJECT_STORE_AUTO_CREATE_BUCKET` (typically `false` for AWS S3)
+- `OBJECT_STORE_MANAGE_CORS` (typically `false` for AWS S3, `true` for local MinIO)
+- `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN` (optional if using IAM role)
 - `QUEUE_BACKEND` (`redis_stream`, `log`, or `sqs`)
 - `QUEUE_EVENT_LOG` (default `logs/queue/bulk_ingest_events.jsonl`)
 - `QUEUE_OFFSET_FILE` (default `logs/queue/bulk_ingest_events.offset`)

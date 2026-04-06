@@ -17,16 +17,16 @@ def _missing(env: dict[str, str], keys: Iterable[str]) -> list[str]:
 
 def validate_backend_env(*, env: dict[str, str] | None = None, raise_on_error: bool = False) -> list[str]:
     ctx = env if env is not None else dict(os.environ)
-    required = [
-        "MINIO_ENDPOINT",
-        "MINIO_ACCESS_KEY",
-        "MINIO_SECRET_KEY",
-        "MINIO_BUCKET",
-        "ES_URL",
-        "ES_INDEX",
-        "NAS_AUDIT_LOG",
-    ]
+    required = ["ES_URL", "ES_INDEX", "NAS_AUDIT_LOG"]
     missing = _missing(ctx, required)
+    bucket = (
+        ctx.get("OBJECT_STORE_BUCKET")
+        or ctx.get("S3_BUCKET")
+        or ctx.get("AWS_S3_BUCKET")
+        or ctx.get("MINIO_BUCKET")
+    )
+    if bucket is None or str(bucket).strip() == "":
+        missing.append("OBJECT_STORE_BUCKET|S3_BUCKET|MINIO_BUCKET")
     if missing and raise_on_error:
         raise EnvValidationError(f"Missing required backend env vars: {', '.join(missing)}")
     return missing

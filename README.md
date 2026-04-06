@@ -83,7 +83,7 @@ Flow notes:
 - `backend/app/queue/producer.py`: async queue producer abstraction + Redis Stream/SQS/log implementations.
 - `backend/app/workers/queue_consumer.py`: async worker consumer example.
 - `run_all.sh`: one-step script to run pipeline + load.
-- `docker-compose.yml`: PostGIS + optional Elasticsearch (`search`) + MinIO (`objectstore`) profiles.
+- `docker-compose.yml`: PostGIS + optional Elasticsearch + local MinIO for dev object storage.
 - `.env`: runtime config used by Docker, backend, and loaders (a template is in `.env.example`).
 - `config/config.json`: main pipeline config (column aliases, boundary/locality matching, replacements).
 
@@ -190,19 +190,95 @@ venv/bin/python search_elasticsearch.py \
   --size 10
 ```
 
-## MinIO (Upload Object Store)
-Start MinIO:
+## Object Storage
+Production deployments can use AWS S3 directly.
+
+DevOps checklist for AWS S3:
+1. Create the bucket that will hold uploaded source files, for example `nas-uploads-prod`.
+2. Give the API and worker runtime permission to the bucket using IAM role or access keys.
+3. Set application env vars for S3.
+4. Configure bucket CORS if browser multipart upload will be used.
+5. Deploy both `api` and `worker` with the same object-store env vars.
+
+Recommended AWS S3 env:
+
+```env
+OBJECT_STORE_BUCKET=nas-uploads-prod
+AWS_REGION=ap-southeast-5
+
+# Leave empty for real AWS S3
+OBJECT_STORE_ENDPOINT=
+OBJECT_STORE_PUBLIC_ENDPOINT=
+
+OBJECT_STORE_SECURE=true
+OBJECT_STORE_PUBLIC_SECURE=true
+OBJECT_STORE_USE_PATH_STYLE=false
+OBJECT_STORE_AUTO_CREATE_BUCKET=false
+OBJECT_STORE_MANAGE_CORS=false
+
+# Use either IAM role or explicit credentials
+AWS_ACCESS_KEY_ID=
+AWS_SECRET_ACCESS_KEY=
+AWS_SESSION_TOKEN=
+```
+
+AWS notes:
+- For AWS S3, leave `OBJECT_STORE_ENDPOINT` empty. Setting it is only for S3-compatible services like MinIO.
+- `OBJECT_STORE_AUTO_CREATE_BUCKET=false` means the bucket must already exist before the app starts.
+- `OBJECT_STORE_MANAGE_CORS=false` means bucket CORS should be managed by infrastructure, not by the app.
+- `OBJECT_STORE_USE_PATH_STYLE=false` is correct for AWS S3.
+
+Minimum bucket permissions needed by API/worker:
+- `s3:ListBucket`
+- `s3:GetObject`
+- `s3:PutObject`
+- `s3:AbortMultipartUpload`
+- `s3:ListBucketMultipartUploads`
+- `s3:ListMultipartUploadParts`
+
+If browser multipart upload is enabled, configure S3 bucket CORS similar to:
+
+```json
+[
+  {
+    "AllowedHeaders": ["*"],
+    "AllowedMethods": ["GET", "PUT", "POST", "HEAD"],
+    "AllowedOrigins": [
+      "https://your-frontend.example.com",
+      "http://localhost:5173"
+    ],
+    "ExposeHeaders": ["ETag"],
+    "MaxAgeSeconds": 3600
+  }
+]
+```
+
+Deployment requirement:
+- deploy `api` and `worker` with identical `OBJECT_STORE_*` / `AWS_*` env vars
+- if only `api` is deployed, uploads can be accepted but queued ingest jobs will not be processed
+
+For local development, you can still run MinIO as an S3-compatible endpoint:
 ```bash
 docker compose up -d minio
 ```
 
-Default endpoints:
-- API: `http://localhost:9000`
-- Console: `http://localhost:9001`
-- Credentials are read from `.env` (`MINIO_ACCESS_KEY` / `MINIO_SECRET_KEY`).
-- Browser multipart uploads use `MINIO_PUBLIC_ENDPOINT`. Set it to a host/IP that the browser can actually reach.
-  - Local-only example: `MINIO_PUBLIC_ENDPOINT=localhost:9000`
-  - LAN example: `MINIO_PUBLIC_ENDPOINT=192.168.x.x:9000`
+Local MinIO example:
+- `OBJECT_STORE_BUCKET=nas-uploads`
+- `OBJECT_STORE_ENDPOINT=localhost:9000`
+- `OBJECT_STORE_PUBLIC_ENDPOINT=localhost:9000`
+- `OBJECT_STORE_USE_PATH_STYLE=true`
+- `OBJECT_STORE_AUTO_CREATE_BUCKET=true`
+- `OBJECT_STORE_MANAGE_CORS=true`
+- `AWS_ACCESS_KEY_ID=<your minio access key>`
+- `AWS_SECRET_ACCESS_KEY=<your minio secret key>`
+
+MinIO console: `http://localhost:9001`
+
+Quick verification after deploy:
+1. `GET /api/v1/health` should report object storage as up.
+2. Upload a small file with `POST /api/v1/ingest/upload`.
+3. Confirm the object appears in the configured S3 bucket.
+4. Confirm the worker moves the job from `queued` to `running` to `completed`.
 
 ## Backend API
 Run API server:
@@ -243,7 +319,7 @@ Available API endpoints:
 Upload + process flow:
 1. For smaller files, the client sends `POST /api/v1/ingest/upload` directly to the backend.
 2. For larger files, or when a saved resumable session exists, the client uses the multipart upload flow.
-3. Multipart mode returns presigned part URLs so the browser can upload chunks directly to `nas-uploads`.
+3. Multipart mode returns presigned part URLs so the browser can upload chunks directly to the configured object storage bucket.
 4. Backend creates or completes the ingest job record and queues the event (`QUEUE_BACKEND=redis_stream|log|sqs`).
 5. Worker consumes the event and runs `pipeline.py` (and optional DB load).
 6. Job output written to `output/uploads/<job_id>/cleaned|failed`.

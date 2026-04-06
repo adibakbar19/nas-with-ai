@@ -15,11 +15,11 @@ from typing import Any
 import requests
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from minio import Minio
 from etl.env_check import validate_backend_env
 from backend.app.dependencies import get_queue_producer
 from backend.app.repositories.ingest_job_state_repository import IngestJobStateRepository, psycopg
 from backend.app.schemas.ingest import BulkIngestEvent
+from object_store import ObjectStoreSettings, build_s3_client, ensure_bucket_exists
 
 
 APP_DIR = Path(__file__).resolve().parent
@@ -79,11 +79,11 @@ INGEST_STALE_CLAIM_RECOVERY_INTERVAL_SECONDS = max(
     int(os.getenv("INGEST_STALE_CLAIM_RECOVERY_INTERVAL_SECONDS", "30")),
 )
 AUDIT_LOG_PATH = Path(os.getenv("NAS_AUDIT_LOG", "logs/nas_audit.log"))
-MINIO_ENDPOINT = os.getenv("MINIO_ENDPOINT", "localhost:9000")
-MINIO_ACCESS_KEY = os.getenv("MINIO_ACCESS_KEY")
-MINIO_SECRET_KEY = os.getenv("MINIO_SECRET_KEY")
-MINIO_SECURE = os.getenv("MINIO_SECURE", "false").lower() in {"1", "true", "yes", "y"}
-MINIO_BUCKET = os.getenv("MINIO_BUCKET", "nas-uploads")
+OBJECT_STORE = ObjectStoreSettings.from_env()
+OBJECT_STORE_BUCKET = OBJECT_STORE.bucket
+OBJECT_STORE_ENDPOINT = OBJECT_STORE.endpoint
+OBJECT_STORE_PUBLIC_ENDPOINT = OBJECT_STORE.public_endpoint
+OBJECT_STORE_SECURE = OBJECT_STORE.secure
 INGEST_EXECUTION_MODE = os.getenv("INGEST_EXECUTION_MODE", "local_thread").strip().lower()
 INGEST_JOB_STATE_DSN = os.getenv(
     "INGEST_JOB_STATE_DSN",
@@ -232,17 +232,9 @@ def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def _get_minio_client() -> Minio:
-    if not MINIO_ACCESS_KEY or not MINIO_SECRET_KEY:
-        raise RuntimeError("MINIO_ACCESS_KEY and MINIO_SECRET_KEY must be set in .env")
-    client = Minio(
-        endpoint=MINIO_ENDPOINT,
-        access_key=MINIO_ACCESS_KEY,
-        secret_key=MINIO_SECRET_KEY,
-        secure=MINIO_SECURE,
-    )
-    if not client.bucket_exists(MINIO_BUCKET):
-        client.make_bucket(MINIO_BUCKET)
+def _get_object_store_client():
+    client = build_s3_client(OBJECT_STORE)
+    ensure_bucket_exists(client, OBJECT_STORE)
     return client
 
 
@@ -466,7 +458,7 @@ def _queue_ingest_job(job_id: str) -> None:
     event = BulkIngestEvent(
         job_id=job_id,
         object_name=str(job.get("object_name") or ""),
-        bucket=str(job.get("bucket") or MINIO_BUCKET),
+        bucket=str(job.get("bucket") or OBJECT_STORE_BUCKET),
         file_name=job.get("file_name"),
         source_type=str(job.get("source_type") or "csv"),
         config_path=str(job.get("config_path") or "config/config.json"),
@@ -666,8 +658,8 @@ def _run_ingest_job(job_id: str) -> None:
         has_checkpoints = checkpoint_root.exists() and any(checkpoint_root.iterdir())
         should_resume = resume_from_checkpoint and has_checkpoints
 
-        client = _get_minio_client()
-        client.fget_object(MINIO_BUCKET, object_name, str(local_input))
+        client = _get_object_store_client()
+        client.download_file(str(job.get("bucket") or OBJECT_STORE_BUCKET), object_name, str(local_input))
 
         cmd = [
             sys.executable,
