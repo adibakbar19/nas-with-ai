@@ -37,7 +37,7 @@ from domain.models import ConfidenceSignals
 from domain.scoring import calculate_confidence, confidence_band
 from .address_parse import parse_full_address
 from .lookup_match import match_lookup_exact, match_lookup_fuzzy, match_mukim_fuzzy
-from .sedona_utils import register_sedona
+from .sedona_utils import quiet_spark_spatial_warnings, register_sedona
 
 DEFAULT_PBT_DIR = os.path.join("data", "boundary", "Sempadan Kawalan PBT")
 LEGACY_PBT_DIR = os.path.join("data", "Sempadan Kawalan PBT")
@@ -608,7 +608,11 @@ def _point_wkt_from_lat_lon(lat_col, lon_col):
 
 
 def _load_pbt_boundaries(spark, pbt_dir: str, *, simplify_tolerance: Optional[float] = None) -> DataFrame:
-    shp_paths = sorted(glob(os.path.join(pbt_dir, "*.shp")))
+    shp_paths = sorted(
+        path
+        for path in glob(os.path.join(os.path.abspath(pbt_dir), "*.shp"))
+        if os.path.isfile(path)
+    )
     if not shp_paths:
         raise ValueError(f"No shapefiles found in PBT directory: {pbt_dir}")
 
@@ -762,6 +766,16 @@ def _pick_boundary_col(df: DataFrame, candidates: list[str]) -> Optional[str]:
         if cand.lower() in cols:
             return cols[cand.lower()]
     return None
+
+
+def _load_pbt_boundaries_from_db(spark, *, config: dict) -> DataFrame:
+    table_name = str(config.get("pbt_boundary_table", "pbt")).strip() or "pbt"
+    return _load_boundary_frame_from_db(
+        spark,
+        config=config,
+        table_name=table_name,
+        select_cols=["pbt_id", "pbt_name"],
+    )
 
 
 def _assign_admin_from_boundaries(
@@ -1819,20 +1833,45 @@ def clean_addresses(
     requested_pbt_dir = config.get("pbt_dir", DEFAULT_PBT_DIR)
     pbt_dir = _resolve_pbt_dir(requested_pbt_dir)
     pbt_simplify_tolerance = float(config.get("pbt_simplify_tolerance", 0.0))
-    if pbt_enabled and pbt_dir:
-        try:
-            if requested_pbt_dir != pbt_dir:
-                print(f"Info: resolved PBT directory from {requested_pbt_dir} to {pbt_dir}")
-            register_sedona(spark)
-            pbt_df = _load_pbt_boundaries(spark, pbt_dir, simplify_tolerance=pbt_simplify_tolerance)
-            pbt_cols = {c.lower(): c for c in pbt_df.columns}
-            pbt_id_col = config.get("pbt_id_column", "pbt_id")
-            pbt_name_col = config.get("pbt_name_column", "NAMA_PBT")
-            pbt_id_col = pbt_cols.get(pbt_id_col.lower())
-            pbt_name_col = pbt_cols.get(pbt_name_col.lower())
+    pbt_df = None
+    pbt_error: Exception | None = None
+    if pbt_enabled:
+        if boundary_source in {"db", "auto"}:
+            try:
+                register_sedona(spark)
+                quiet_spark_spatial_warnings(spark)
+                pbt_df = _load_pbt_boundaries_from_db(spark, config=config)
+            except Exception as exc:
+                pbt_error = exc
+                if boundary_source == "auto":
+                    print(f"Warning: PBT boundary DB mapping failed, falling back to files: {exc}")
+        if pbt_df is None and boundary_source in {"files", "auto"}:
+            if pbt_dir:
+                try:
+                    if requested_pbt_dir != pbt_dir:
+                        print(f"Info: resolved PBT directory from {requested_pbt_dir} to {pbt_dir}")
+                    register_sedona(spark)
+                    quiet_spark_spatial_warnings(spark)
+                    pbt_df = _load_pbt_boundaries(spark, pbt_dir, simplify_tolerance=pbt_simplify_tolerance)
+                except Exception as exc:
+                    pbt_error = exc
+            else:
+                pbt_error = FileNotFoundError(
+                    "PBT mapping skipped because boundary directory is unavailable. "
+                    f"Requested: {requested_pbt_dir}"
+                )
+        if pbt_df is not None:
+            pbt_id_col = _pick_boundary_col(
+                pbt_df,
+                ["pbt_id", str(config.get("pbt_id_column", "pbt_id"))],
+            )
+            pbt_name_col = _pick_boundary_col(
+                pbt_df,
+                ["pbt_name", str(config.get("pbt_name_column", "NAMA_PBT")), "NAMA_PBT"],
+            )
             if not pbt_id_col or not pbt_name_col:
                 raise ValueError(
-                    "PBT shapefile missing required columns. "
+                    "PBT boundary data missing required columns. "
                     f"Found: {sorted(pbt_df.columns)}"
                 )
             df = _assign_pbt(
@@ -1841,13 +1880,8 @@ def clean_addresses(
                 pbt_id_col=pbt_id_col,
                 pbt_name_col=pbt_name_col,
             )
-        except Exception as exc:
-            print(f"Warning: PBT mapping skipped due to Sedona/shapefile issue: {exc}")
-    elif pbt_enabled:
-        print(
-            "Warning: PBT mapping skipped because boundary directory is unavailable. "
-            f"Requested: {requested_pbt_dir}"
-        )
+        elif pbt_error is not None:
+            print(f"Warning: PBT mapping skipped due to boundary setup issue: {pbt_error}")
 
     state_map = state_df.select(
         upper(col("state_name")).alias("_state_name_lookup"),

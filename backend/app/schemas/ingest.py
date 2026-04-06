@@ -41,3 +41,26 @@ class AcceptedJobResponse(BaseModel):
     status: str
     message: str
     status_url: str
+
+
+class MultipartUploadInitiateRequest(BaseModel):
+    file_name: str = Field(min_length=1)
+    content_bytes: int = Field(gt=0)
+    content_type: str | None = None
+    auto_start: bool = Field(default=True)
+    load_to_db: bool = Field(default=True)
+    resume_from_checkpoint: bool = Field(default=True)
+    resume_failed_only: bool = Field(default=True)
+
+
+class MultipartUploadPartUrlRequest(BaseModel):
+    part_number: int = Field(ge=1)
+
+
+class MultipartUploadedPart(BaseModel):
+    part_number: int = Field(ge=1)
+    etag: str = Field(min_length=1)
+
+
+class MultipartUploadCompleteRequest(BaseModel):
+    parts: list[MultipartUploadedPart] = Field(min_length=1)

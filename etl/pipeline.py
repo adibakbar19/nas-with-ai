@@ -24,7 +24,12 @@ from .audit_log import audit_event, start_audit_run
 from .extract import extract_data
 from .load import load_parquet, load_success_failed
 from .naskod_utils import add_standard_naskod
-from .sedona_utils import configure_sedona_builder, merge_spark_packages, resolve_sedona_spark_packages
+from .sedona_utils import (
+    configure_common_spark_builder,
+    configure_sedona_builder,
+    merge_spark_packages,
+    resolve_sedona_spark_packages,
+)
 from .transform import clean_addresses, validate_addresses
 
 
@@ -321,39 +326,71 @@ def rebuild_record_status(
     rebuilt_frames = []
 
     if _has_parquet_files(spark, validated_success_path):
-        success_df = _read_stage_df(spark, validated_success_path)
-        if "record_id" in success_df.columns:
-            rebuilt_frames.append(
-                success_df.select("record_id")
-                .dropna(subset=["record_id"])
-                .dropDuplicates(["record_id"])
-                .withColumn("stage", lit("validate"))
-                .withColumn("status", lit("SUCCESS"))
-                .withColumn("error_reason", lit(None).cast("string"))
-                .withColumn("updated_ms", lit(now_ms))
+        try:
+            success_df = _read_stage_df(spark, validated_success_path)
+            if "record_id" in success_df.columns:
+                rebuilt_frames.append(
+                    success_df.select("record_id")
+                    .dropna(subset=["record_id"])
+                    .dropDuplicates(["record_id"])
+                    .withColumn("stage", lit("validate"))
+                    .withColumn("status", lit("SUCCESS"))
+                    .withColumn("error_reason", lit(None).cast("string"))
+                    .withColumn("updated_ms", lit(now_ms))
+                )
+            else:
+                _stage_log(
+                    "record_status",
+                    "rebuild_skip",
+                    reason="validated_success_missing_record_id",
+                    stage_path=validated_success_path,
+                )
+        except Exception as exc:
+            _stage_log(
+                "record_status",
+                "rebuild_skip",
+                reason="validated_success_read_failed",
+                stage_path=validated_success_path,
+                error=exc,
             )
 
     if _has_parquet_files(spark, validated_failed_path):
-        failed_df = _read_stage_df(spark, validated_failed_path)
-        if "record_id" in failed_df.columns:
-            status_df = (
-                failed_df.select("record_id")
-                .dropna(subset=["record_id"])
-                .dropDuplicates(["record_id"])
-                .withColumn("stage", lit("validate"))
-                .withColumn("status", lit("FAILED"))
-                .withColumn("updated_ms", lit(now_ms))
-            )
-            if "error_reason" in failed_df.columns:
-                err_df = (
-                    failed_df.select("record_id", col("error_reason").cast("string").alias("error_reason"))
+        try:
+            failed_df = _read_stage_df(spark, validated_failed_path)
+            if "record_id" in failed_df.columns:
+                status_df = (
+                    failed_df.select("record_id")
                     .dropna(subset=["record_id"])
                     .dropDuplicates(["record_id"])
+                    .withColumn("stage", lit("validate"))
+                    .withColumn("status", lit("FAILED"))
+                    .withColumn("updated_ms", lit(now_ms))
                 )
-                status_df = status_df.join(err_df, "record_id", "left")
+                if "error_reason" in failed_df.columns:
+                    err_df = (
+                        failed_df.select("record_id", col("error_reason").cast("string").alias("error_reason"))
+                        .dropna(subset=["record_id"])
+                        .dropDuplicates(["record_id"])
+                    )
+                    status_df = status_df.join(err_df, "record_id", "left")
+                else:
+                    status_df = status_df.withColumn("error_reason", lit(None).cast("string"))
+                rebuilt_frames.append(status_df)
             else:
-                status_df = status_df.withColumn("error_reason", lit(None).cast("string"))
-            rebuilt_frames.append(status_df)
+                _stage_log(
+                    "record_status",
+                    "rebuild_skip",
+                    reason="validated_failed_missing_record_id",
+                    stage_path=validated_failed_path,
+                )
+        except Exception as exc:
+            _stage_log(
+                "record_status",
+                "rebuild_skip",
+                reason="validated_failed_read_failed",
+                stage_path=validated_failed_path,
+                error=exc,
+            )
 
     if not rebuilt_frames:
         raise RuntimeError(
@@ -376,6 +413,68 @@ def rebuild_record_status(
     )
     _stage_log("record_status", "rebuild_done", row_count=row_count, status_path=status_path)
     return row_count
+
+
+def _cleanup_resume_failed_only_checkpoints(
+    spark: SparkSession,
+    *,
+    paths: list[str],
+    reason: str,
+) -> None:
+    for path in paths:
+        if not _path_exists(spark, path):
+            continue
+        _stage_log("record_status", "cleanup_checkpoint", reason=reason, stage_path=path)
+        _delete_path_if_exists(spark, path)
+
+
+def _load_resume_failed_only_status(
+    spark: SparkSession,
+    *,
+    status_path: str,
+    validated_success_path: str,
+    validated_failed_path: str,
+    checkpoint_root: str,
+    job_id: str,
+    reset_paths: list[str],
+):
+    try:
+        if not _has_parquet_files(spark, status_path):
+            _stage_log("record_status", "rebuild_needed", reason="missing_or_incomplete")
+            rebuild_record_status(
+                spark,
+                status_path=status_path,
+                validated_success_path=validated_success_path,
+                validated_failed_path=validated_failed_path,
+                checkpoint_root=checkpoint_root,
+                job_id=job_id,
+            )
+        try:
+            return _read_stage_df(spark, status_path), True
+        except Exception as exc:
+            _stage_log("record_status", "rebuild_needed", reason="status_read_failed", error=exc)
+            rebuild_record_status(
+                spark,
+                status_path=status_path,
+                validated_success_path=validated_success_path,
+                validated_failed_path=validated_failed_path,
+                checkpoint_root=checkpoint_root,
+                job_id=job_id,
+            )
+            return _read_stage_df(spark, status_path), True
+    except Exception as exc:
+        _stage_log(
+            "record_status",
+            "resume_fallback_full_rerun",
+            reason="status_unavailable_after_rebuild",
+            error=exc,
+        )
+        _cleanup_resume_failed_only_checkpoints(
+            spark,
+            paths=reset_paths,
+            reason="status_unavailable_after_rebuild",
+        )
+        return None, False
 
 
 def parse_args() -> argparse.Namespace:
@@ -443,15 +542,7 @@ def main():
             .config("spark.executor.extraJavaOptions", "-Djava.security.manager=allow")
             .master("local[*]")
         )
-        spark_driver_memory = os.getenv("SPARK_DRIVER_MEMORY")
-        spark_executor_memory = os.getenv("SPARK_EXECUTOR_MEMORY")
-        spark_shuffle_partitions = os.getenv("SPARK_SQL_SHUFFLE_PARTITIONS")
-        if spark_driver_memory:
-            builder = builder.config("spark.driver.memory", spark_driver_memory)
-        if spark_executor_memory:
-            builder = builder.config("spark.executor.memory", spark_executor_memory)
-        if spark_shuffle_partitions:
-            builder = builder.config("spark.sql.shuffle.partitions", spark_shuffle_partitions)
+        builder = configure_common_spark_builder(builder)
         builder = configure_sedona_builder(builder)
         jars_packages = resolve_sedona_spark_packages()
         if _lookup_source_from_config(args.config) == "db":
@@ -536,68 +627,72 @@ def main():
             )
         df_raw = _attach_record_id(df_raw)
 
+        resume_failed_filter_applied = False
         if args.resume_failed_only:
-            status_df = None
-            if not _has_parquet_files(spark, status_path):
-                _stage_log("record_status", "rebuild_needed", reason="missing_or_incomplete")
-                rebuild_record_status(
-                    spark,
-                    status_path=status_path,
-                    validated_success_path=stage_success,
-                    validated_failed_path=stage_failed,
-                    checkpoint_root=checkpoint_root,
-                    job_id=job_id,
-                )
-            try:
-                status_df = _read_stage_df(spark, status_path)
-            except Exception as exc:
-                _stage_log("record_status", "rebuild_needed", reason="status_read_failed", error=exc)
-                rebuild_record_status(
-                    spark,
-                    status_path=status_path,
-                    validated_success_path=stage_success,
-                    validated_failed_path=stage_failed,
-                    checkpoint_root=checkpoint_root,
-                    job_id=job_id,
-                )
-                status_df = _read_stage_df(spark, status_path)
-            pending_ids = (
-                status_df.filter(upper(coalesce(col("status"), lit(""))) != lit("DONE"))
-                .select("record_id")
-                .dropna(subset=["record_id"])
-                .dropDuplicates(["record_id"])
+            status_df, resume_failed_filter_applied = _load_resume_failed_only_status(
+                spark,
+                status_path=status_path,
+                validated_success_path=stage_success,
+                validated_failed_path=stage_failed,
+                checkpoint_root=checkpoint_root,
+                job_id=job_id,
+                reset_paths=[
+                    status_path,
+                    stage_extract_resume_filtered,
+                    stage_success,
+                    stage_failed,
+                    stage_success_final,
+                    stage_failed_final,
+                ],
             )
-            pending_count = pending_ids.count()
-            if pending_count == 0:
+            if resume_failed_filter_applied:
+                pending_ids = (
+                    status_df.filter(upper(coalesce(col("status"), lit(""))) != lit("DONE"))
+                    .select("record_id")
+                    .dropna(subset=["record_id"])
+                    .dropDuplicates(["record_id"])
+                )
+                pending_count = pending_ids.count()
+                if pending_count == 0:
+                    audit_event(
+                        args.audit_log,
+                        "pipeline",
+                        run_id,
+                        "no_pending_records",
+                        status_path=status_path,
+                    )
+                    return
+                before_count = df_raw.count()
+                df_raw = df_raw.join(pending_ids, "record_id", "inner")
+                after_count = df_raw.count()
                 audit_event(
                     args.audit_log,
                     "pipeline",
                     run_id,
-                    "no_pending_records",
+                    "resume_failed_filter",
                     status_path=status_path,
+                    before_count=before_count,
+                    after_count=after_count,
                 )
-                return
-            before_count = df_raw.count()
-            df_raw = df_raw.join(pending_ids, "record_id", "inner")
-            after_count = df_raw.count()
-            audit_event(
-                args.audit_log,
-                "pipeline",
-                run_id,
-                "resume_failed_filter",
-                status_path=status_path,
-                before_count=before_count,
-                after_count=after_count,
-            )
-            _write_stage_df(
-                spark,
-                df_raw,
-                stage_extract_resume_filtered,
-                stage="extract_resume_filtered",
-                job_id=job_id,
-                checkpoint_root=checkpoint_root,
-            )
-            df_raw = _read_stage_df(spark, stage_extract_resume_filtered)
+                _write_stage_df(
+                    spark,
+                    df_raw,
+                    stage_extract_resume_filtered,
+                    stage="extract_resume_filtered",
+                    job_id=job_id,
+                    checkpoint_root=checkpoint_root,
+                )
+                df_raw = _read_stage_df(spark, stage_extract_resume_filtered)
+            else:
+                audit_event(
+                    args.audit_log,
+                    "pipeline",
+                    run_id,
+                    "resume_failed_fallback_full_rerun",
+                    status_path=status_path,
+                    validated_success_path=stage_success,
+                    validated_failed_path=stage_failed,
+                )
 
         _upsert_status(
             spark,
@@ -850,7 +945,7 @@ def main():
             job_id=job_id,
         )
 
-        if args.resume_failed_only and _path_exists(spark, success_path) and _path_exists(spark, failed_path):
+        if resume_failed_filter_applied and _path_exists(spark, success_path) and _path_exists(spark, failed_path):
             prev_success = _read_stage_df(spark, success_path)
             prev_failed = _read_stage_df(spark, failed_path)
             if "record_id" in prev_success.columns and "record_id" in prev_failed.columns:

@@ -40,6 +40,7 @@
   "strict_admin_boundary": true,
   "boundary_source": "db",
   "boundary_db_schema": "nas_lookup",
+  "pbt_boundary_table": "pbt",
   "state_boundary_table": "state_boundary",
   "district_boundary_table": "district_boundary",
   "mukim_boundary_table": "mukim_boundary",

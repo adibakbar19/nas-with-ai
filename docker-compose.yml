@@ -14,6 +14,15 @@ services:
     volumes:
       - pgdata:/var/lib/postgresql/data
       - ./docker/init-postgis.sql:/docker-entrypoint-initdb.d/init-postgis.sql:ro
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "pg_isready -h 127.0.0.1 -p 5432 -U ${PGUSER:-postgres} -d ${PGDATABASE:-postgres} || exit 1",
+        ]
+      interval: 5s
+      timeout: 5s
+      retries: 20
       
   elasticsearch:
     image: docker.elastic.co/elasticsearch/elasticsearch:8.15.3
@@ -43,6 +52,41 @@ services:
     volumes:
       - miniodata:/data
 
+  redis:
+    image: redis:7-alpine
+    container_name: nas-redis
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+
+  bootstrap-lookups:
+    build:
+      context: .
+      dockerfile: Dockerfile.backend
+    container_name: nas-bootstrap-lookups
+    env_file:
+      - .env
+    environment:
+      - PGHOST=postgres
+      - PGPORT=5432
+    command: >
+      python bootstrap_lookups_if_needed.py
+      --lookups-dir data/lookups
+      --granite-root data/granite_map_info-master
+      --locality-lookup data/lookups/locality_lookup.csv
+      --rebuild-locality-lookup
+      --schema ${LOOKUP_SCHEMA:-nas_lookup}
+    volumes:
+      - ./:/app
+    depends_on:
+      postgres:
+        condition: service_healthy
+
   api:
     build:
       context: .
@@ -52,19 +96,29 @@ services:
       - .env
     environment:
       - PGHOST=postgres
+      - PGPORT=5432
       - MINIO_ENDPOINT=minio:9000
       - ES_URL=http://elasticsearch:9200
       - INGEST_EXECUTION_MODE=queue_worker
+      - QUEUE_BACKEND=redis_stream
+      - REDIS_URL=redis://redis:6379/0
+      - REDIS_STREAM_KEY=bulk_ingest_events
+      - REDIS_STREAM_GROUP=bulk_ingest_workers
     command: uvicorn backend.app.main:app --host 0.0.0.0 --port 8000
     ports:
       - "8000:8000"
     volumes:
       - ./:/app
     depends_on:
-      - postgres
-      - minio
-    profiles:
-      - api
+      postgres:
+        condition: service_healthy
+      minio:
+        condition: service_started
+      redis:
+        condition: service_healthy
+      bootstrap-lookups:
+        condition: service_completed_successfully
+    restart: unless-stopped
 
   worker:
     build:
@@ -75,17 +129,27 @@ services:
       - .env
     environment:
       - PGHOST=postgres
+      - PGPORT=5432
       - MINIO_ENDPOINT=minio:9000
       - ES_URL=http://elasticsearch:9200
       - INGEST_EXECUTION_MODE=queue_worker
+      - QUEUE_BACKEND=redis_stream
+      - REDIS_URL=redis://redis:6379/0
+      - REDIS_STREAM_KEY=bulk_ingest_events
+      - REDIS_STREAM_GROUP=bulk_ingest_workers
     command: python -m backend.app.workers.queue_consumer
     volumes:
       - ./:/app
     depends_on:
-      - postgres
-      - minio
-    profiles:
-      - worker
+      postgres:
+        condition: service_healthy
+      minio:
+        condition: service_started
+      redis:
+        condition: service_healthy
+      bootstrap-lookups:
+        condition: service_completed_successfully
+    restart: unless-stopped
 
 volumes:
   pgdata:

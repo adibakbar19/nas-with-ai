@@ -22,10 +22,17 @@ Store secrets only in `.env` (do not hardcode credentials in code/config).
 Recommended Spark tuning in `.env`:
 
 ```bash
-SPARK_DRIVER_MEMORY=6g
-SPARK_EXECUTOR_MEMORY=6g
-SPARK_SQL_SHUFFLE_PARTITIONS=64
+SPARK_DRIVER_MEMORY=2g
+SPARK_EXECUTOR_MEMORY=2g
+SPARK_SQL_SHUFFLE_PARTITIONS=16
 ```
+
+Increase them only if Docker/Desktop has enough memory headroom; otherwise the Spark JVM can be OOM-killed mid-run.
+
+Postgres port note:
+- From the host machine, Docker Postgres is exposed on `localhost:5433`.
+- Inside Docker, backend services still use `postgres:5432`.
+- This avoids collisions with a separate local Postgres instance already bound to `5432`.
 
 ## 3) Standard Run
 
@@ -59,13 +66,21 @@ venv/bin/python bootstrap_lookups.py \
   --schema nas_lookup
 ```
 
-This also writes `nas.lookup_version`, used by Spark lookup cache invalidation.
+If you are running the backend stack via Docker and using host-side tools, connect to Postgres on `localhost:5433`.
+Equivalent check:
+
+```bash
+PGPASSWORD=postgres psql -h localhost -p 5433 -U postgres -d postgres -c '\dt nas_lookup.*'
+```
+
+This also writes `nas_lookup.lookup_version`, used by Spark lookup cache invalidation.
 
 To make ETL use DB lookups + DB boundaries + cache, set in `config/config.json`:
 - `"lookup_source": "db"`
 - `"lookup_db_schema": "nas_lookup"`
 - `"boundary_source": "db"`
 - `"boundary_db_schema": "nas_lookup"`
+- `"pbt_boundary_table": "pbt"`
 - `"lookup_cache_enabled": true`
 - `"lookup_cache_dir": "output/lookups_cache"`
 
@@ -211,7 +226,7 @@ Useful env vars:
 ## 11) Start MinIO For Upload Feature
 
 ```bash
-docker compose --profile objectstore up -d minio
+docker compose up -d minio
 ```
 
 Defaults:
@@ -236,9 +251,17 @@ python -m backend.app.workers.queue_consumer
 Optional Docker services:
 
 ```bash
-docker compose --profile api up -d api
-docker compose --profile worker up -d worker
+docker compose up -d api worker
 ```
+
+Full Docker stack, including frontend and automatic lookup bootstrap:
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.frontend.yml up -d
+```
+
+This waits for Postgres, checks whether `nas_lookup.lookup_version` already exists, and only bootstraps the
+`nas_lookup` tables on first-time setup. Then it starts `api` and `worker`.
 
 Start Vue UI in separate terminal:
 

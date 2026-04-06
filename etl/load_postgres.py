@@ -8,16 +8,19 @@ from pyspark.sql.functions import (
     col,
     coalesce,
     concat,
+    concat_ws,
     current_timestamp,
     expr,
     regexp_extract,
     regexp_replace,
     lit,
     lpad,
+    max as spark_max,
     monotonically_increasing_id,
     isnan,
     row_number,
     sha2,
+    split,
     trim,
     upper,
     when,
@@ -31,7 +34,13 @@ from domain.replacements import (
 )
 
 from .audit_log import audit_event, start_audit_run
-from .sedona_utils import configure_sedona_builder, merge_spark_packages, resolve_sedona_spark_packages
+from .sedona_utils import (
+    configure_common_spark_builder,
+    configure_sedona_builder,
+    merge_spark_packages,
+    quiet_spark_spatial_warnings,
+    resolve_sedona_spark_packages,
+)
 
 DEFAULT_PBT_DIR = os.path.join("data", "boundary", "Sempadan Kawalan PBT")
 LEGACY_PBT_DIR = os.path.join("data", "Sempadan Kawalan PBT")
@@ -107,6 +116,12 @@ def _write_table(df, *, jdbc_url: str, table: str, mode: str, props: dict, repar
     df.write.jdbc(url=jdbc_url, table=table, mode=mode, properties=props)
 
 
+def _write_table_if_has_rows(df, *, jdbc_url: str, table: str, mode: str, props: dict, repartition: int | None = None) -> None:
+    if not _df_has_rows(df):
+        return
+    _write_table(df, jdbc_url=jdbc_url, table=table, mode=mode, props=props, repartition=repartition)
+
+
 def _ensure_column(df, name: str, dtype: str = "string"):
     if name in df.columns:
         return df
@@ -167,6 +182,230 @@ def _get_column_udt_name(
     return rows[0]["udt_name"]
 
 
+def _table_exists(
+    spark: SparkSession,
+    *,
+    jdbc_url: str,
+    user: str,
+    password: str,
+    schema: str,
+    table: str,
+) -> bool:
+    schema_lit = _escape_sql_literal(schema)
+    table_lit = _escape_sql_literal(table)
+    query = (
+        "(SELECT 1 AS exists_flag FROM information_schema.tables "
+        f"WHERE table_schema = '{schema_lit}' AND table_name = '{table_lit}' "
+        "LIMIT 1) table_exists_check"
+    )
+    df = (
+        spark.read.format("jdbc")
+        .option("url", jdbc_url)
+        .option("dbtable", query)
+        .option("user", user)
+        .option("password", password)
+        .option("driver", "org.postgresql.Driver")
+        .load()
+    )
+    return bool(df.take(1))
+
+
+def _read_jdbc_query(
+    spark: SparkSession,
+    *,
+    jdbc_url: str,
+    user: str,
+    password: str,
+    query: str,
+):
+    return (
+        spark.read.format("jdbc")
+        .option("url", jdbc_url)
+        .option("dbtable", f"({query}) jdbc_query")
+        .option("user", user)
+        .option("password", password)
+        .option("driver", "org.postgresql.Driver")
+        .load()
+    )
+
+
+def _df_has_rows(df) -> bool:
+    return bool(df.take(1))
+
+
+def _max_value(df, column_name: str) -> int:
+    rows = df.select(spark_max(col(column_name)).alias("max_value")).collect()
+    if not rows:
+        return 0
+    value = rows[0]["max_value"]
+    return int(value or 0)
+
+
+def _normalized_text_expr(column_name: str):
+    return coalesce(upper(trim(col(column_name).cast("string"))), lit(""))
+
+
+def _address_identity_fingerprint_expr():
+    return sha2(
+        concat_ws(
+            "|",
+            _normalized_text_expr("premise_no"),
+            _normalized_text_expr("building_name"),
+            _normalized_text_expr("floor_level"),
+            _normalized_text_expr("unit_no"),
+            _normalized_text_expr("lot_no"),
+            coalesce(col("street_id").cast("string"), lit("")),
+            coalesce(col("locality_id").cast("string"), lit("")),
+            coalesce(col("mukim_id").cast("string"), lit("")),
+            coalesce(col("district_id").cast("string"), lit("")),
+            coalesce(col("state_id").cast("string"), lit("")),
+            coalesce(col("postcode_id").cast("string"), lit("")),
+            coalesce(col("pbt_id").cast("string"), lit("")),
+            _normalized_text_expr("country"),
+        ),
+        256,
+    )
+
+
+def _pbt_match_key_expr():
+    return when(
+        col("pbt_id").isNotNull(),
+        concat(lit("ID:"), col("pbt_id").cast("string")),
+    ).otherwise(concat(lit("NAME:"), _normalized_text_expr("pbt_name")))
+
+
+def _street_match_key_expr():
+    return concat_ws(
+        "|",
+        _normalized_text_expr("street_name_prefix"),
+        _normalized_text_expr("street_name"),
+        coalesce(col("locality_id").cast("string"), lit("")),
+        coalesce(col("pbt_id").cast("string"), lit("")),
+    )
+
+
+def _load_existing_normalized_state(
+    spark: SparkSession,
+    *,
+    jdbc_url: str,
+    user: str,
+    password: str,
+    schema: str,
+) -> dict[str, object]:
+    result: dict[str, object] = {}
+    if _table_exists(
+        spark,
+        jdbc_url=jdbc_url,
+        user=user,
+        password=password,
+        schema=schema,
+        table="address_type",
+    ):
+        result["address_type"] = _read_jdbc_query(
+            spark,
+            jdbc_url=jdbc_url,
+            user=user,
+            password=password,
+            query=(
+                "SELECT address_type_id, property_type, property_code, ownership_structure "
+                f"FROM {schema}.address_type"
+            ),
+        )
+    if _table_exists(
+        spark,
+        jdbc_url=jdbc_url,
+        user=user,
+        password=password,
+        schema=schema,
+        table="locality",
+    ):
+        result["locality"] = _read_jdbc_query(
+            spark,
+            jdbc_url=jdbc_url,
+            user=user,
+            password=password,
+            query=(
+                "SELECT locality_id, locality_code, locality_name, mukim_id, created_at, updated_at "
+                f"FROM {schema}.locality"
+            ),
+        )
+    if _table_exists(
+        spark,
+        jdbc_url=jdbc_url,
+        user=user,
+        password=password,
+        schema=schema,
+        table="pbt",
+    ):
+        result["pbt"] = _read_jdbc_query(
+            spark,
+            jdbc_url=jdbc_url,
+            user=user,
+            password=password,
+            query=(
+                "SELECT pbt_id, pbt_name, boundary_geom::text AS boundary_geom, is_active, created_at, updated_at "
+                f"FROM {schema}.pbt"
+            ),
+        )
+    if _table_exists(
+        spark,
+        jdbc_url=jdbc_url,
+        user=user,
+        password=password,
+        schema=schema,
+        table="street",
+    ):
+        result["street"] = _read_jdbc_query(
+            spark,
+            jdbc_url=jdbc_url,
+            user=user,
+            password=password,
+            query=(
+                "SELECT street_id, street_name_prefix, street_name, locality_id, pbt_id, created_at, updated_at "
+                f"FROM {schema}.street"
+            ),
+        )
+    if _table_exists(
+        spark,
+        jdbc_url=jdbc_url,
+        user=user,
+        password=password,
+        schema=schema,
+        table="standardized_address",
+    ):
+        result["standardized_address"] = _read_jdbc_query(
+            spark,
+            jdbc_url=jdbc_url,
+            user=user,
+            password=password,
+            query=(
+                "SELECT address_id, premise_no, building_name, floor_level, unit_no, lot_no, "
+                "street_id, locality_id, mukim_id, district_id, state_id, postcode_id, country, "
+                "pbt_id, validation_status, validation_date, validation_by, checksum "
+                f"FROM {schema}.standardized_address"
+            ),
+        )
+    if _table_exists(
+        spark,
+        jdbc_url=jdbc_url,
+        user=user,
+        password=password,
+        schema=schema,
+        table="naskod",
+    ):
+        result["naskod"] = _read_jdbc_query(
+            spark,
+            jdbc_url=jdbc_url,
+            user=user,
+            password=password,
+            query=(
+                "SELECT naskod_id, address_id, code, is_vanity, generated_at, verified, status "
+                f"FROM {schema}.naskod"
+            ),
+        )
+    return result
+
+
 def _append_standardized_address_with_geom_cast(
     spark: SparkSession,
     *,
@@ -204,7 +443,11 @@ def _append_standardized_address_with_geom_cast(
 
 
 def _load_pbt_boundaries(spark: SparkSession, pbt_dir: str):
-    shp_paths = sorted(glob(os.path.join(pbt_dir, "*.shp")))
+    shp_paths = sorted(
+        path
+        for path in glob(os.path.join(os.path.abspath(pbt_dir), "*.shp"))
+        if os.path.isfile(path)
+    )
     if not shp_paths:
         return None
 
@@ -264,7 +507,9 @@ def _build_normalized_tables(
     pbt_boundaries=None,
     pbt_id_column: str = "pbt_id",
     pbt_name_column: str = "NAMA_PBT",
+    existing_context: dict[str, object] | None = None,
 ) -> dict[str, object]:
+    existing_context = existing_context or {}
     df = _ensure_column(df, "address_clean")
     df = _ensure_column(df, "address_type")
     df = _ensure_column(df, "building_name")
@@ -360,14 +605,58 @@ def _build_normalized_tables(
         & (~col("locality_name").isin(*LOCALITY_PLACEHOLDER_VALUES))
         & (~col("locality_name").rlike(LOCALITY_INVALID_PREFIX_REGEX))
     )
-    locality_table = locality_base.dropDuplicates(["locality_name", "mukim_id"])
-    locality_table = locality_table.withColumn(
-        "locality_id",
-        row_number().over(Window.orderBy(col("locality_name").asc_nulls_last(), col("mukim_id").asc_nulls_last())),
-    )
-    locality_table = locality_table.withColumn("locality_code", lit(None).cast("string"))
-    locality_table = locality_table.withColumn("created_at", current_timestamp())
-    locality_table = locality_table.withColumn("updated_at", current_timestamp())
+    locality_candidates = locality_base.dropDuplicates(["locality_name", "mukim_id"])
+    existing_locality = existing_context.get("locality")
+    if existing_locality is not None:
+        existing_locality = existing_locality.select(
+            col("locality_id").cast("int").alias("locality_id"),
+            col("locality_code"),
+            _normalize_locality_col(col("locality_name")).alias("locality_name"),
+            col("mukim_id").cast("int").alias("mukim_id"),
+            col("created_at"),
+            col("updated_at"),
+        ).dropDuplicates(["locality_name", "mukim_id"])
+        locality_new = locality_candidates.join(
+            existing_locality.select("locality_name", "mukim_id"),
+            ["locality_name", "mukim_id"],
+            "leftanti",
+        )
+        locality_new = locality_new.withColumn(
+            "locality_id",
+            lit(_max_value(existing_locality, "locality_id"))
+            + row_number().over(Window.orderBy(col("locality_name").asc_nulls_last(), col("mukim_id").asc_nulls_last())),
+        )
+        locality_new = locality_new.withColumn("locality_code", lit(None).cast("string"))
+        locality_new = locality_new.withColumn("created_at", current_timestamp())
+        locality_new = locality_new.withColumn("updated_at", current_timestamp())
+        locality_table = existing_locality.unionByName(
+            locality_new.select("locality_id", "locality_code", "locality_name", "mukim_id", "created_at", "updated_at"),
+            allowMissingColumns=True,
+        )
+        locality_write = locality_new.select(
+            "locality_id",
+            "locality_code",
+            "locality_name",
+            "mukim_id",
+            "created_at",
+            "updated_at",
+        )
+    else:
+        locality_table = locality_candidates.withColumn(
+            "locality_id",
+            row_number().over(Window.orderBy(col("locality_name").asc_nulls_last(), col("mukim_id").asc_nulls_last())),
+        )
+        locality_table = locality_table.withColumn("locality_code", lit(None).cast("string"))
+        locality_table = locality_table.withColumn("created_at", current_timestamp())
+        locality_table = locality_table.withColumn("updated_at", current_timestamp())
+        locality_write = locality_table.select(
+            "locality_id",
+            "locality_code",
+            "locality_name",
+            "mukim_id",
+            "created_at",
+            "updated_at",
+        )
     locality_with_state = (
         locality_table.join(mukim_table.select("mukim_id", "district_id"), "mukim_id", "left")
         .join(district_table.select("district_id", "state_id"), "district_id", "left")
@@ -415,17 +704,54 @@ def _build_normalized_tables(
         col("postcode"),
     )
 
-    address_type_table = (
+    address_type_candidates = (
         df.select(upper(col("address_type")).alias("property_type"))
         .filter(col("property_type").isNotNull())
         .dropDuplicates(["property_type"])
     )
-    address_type_table = address_type_table.withColumn(
-        "address_type_id",
-        row_number().over(Window.orderBy(col("property_type").asc_nulls_last())),
-    )
-    address_type_table = address_type_table.withColumn("property_code", col("property_type"))
-    address_type_table = address_type_table.withColumn("ownership_structure", lit(None).cast("string"))
+    existing_address_type = existing_context.get("address_type")
+    if existing_address_type is not None:
+        existing_address_type = existing_address_type.select(
+            col("address_type_id").cast("int").alias("address_type_id"),
+            upper(col("property_type")).alias("property_type"),
+            col("property_code"),
+            col("ownership_structure"),
+        ).dropDuplicates(["property_type"])
+        address_type_new = address_type_candidates.join(
+            existing_address_type.select("property_type"),
+            "property_type",
+            "leftanti",
+        )
+        address_type_new = address_type_new.withColumn(
+            "address_type_id",
+            lit(_max_value(existing_address_type, "address_type_id"))
+            + row_number().over(Window.orderBy(col("property_type").asc_nulls_last())),
+        )
+        address_type_new = address_type_new.withColumn("property_code", col("property_type"))
+        address_type_new = address_type_new.withColumn("ownership_structure", lit(None).cast("string"))
+        address_type_table = existing_address_type.unionByName(
+            address_type_new.select("address_type_id", "property_type", "property_code", "ownership_structure"),
+            allowMissingColumns=True,
+        )
+        address_type_write = address_type_new.select(
+            "address_type_id",
+            "property_type",
+            "property_code",
+            "ownership_structure",
+        )
+    else:
+        address_type_table = address_type_candidates.withColumn(
+            "address_type_id",
+            row_number().over(Window.orderBy(col("property_type").asc_nulls_last())),
+        )
+        address_type_table = address_type_table.withColumn("property_code", col("property_type"))
+        address_type_table = address_type_table.withColumn("ownership_structure", lit(None).cast("string"))
+        address_type_write = address_type_table.select(
+            "address_type_id",
+            "property_type",
+            "property_code",
+            "ownership_structure",
+        )
 
     if pbt_boundaries is not None:
         pbt_cols = {c.lower(): c for c in pbt_boundaries.columns}
@@ -456,10 +782,32 @@ def _build_normalized_tables(
         )
         pbt_table = pbt_table.withColumn("boundary_geom", lit(None).cast("string"))
 
-    pbt_table = pbt_table.dropDuplicates(["pbt_id", "pbt_name"])
-    pbt_table = pbt_table.withColumn("is_active", lit(True))
-    pbt_table = pbt_table.withColumn("created_at", current_timestamp())
-    pbt_table = pbt_table.withColumn("updated_at", current_timestamp())
+    pbt_candidates = pbt_table.dropDuplicates(["pbt_id", "pbt_name"])
+    pbt_candidates = pbt_candidates.withColumn("is_active", lit(True))
+    pbt_candidates = pbt_candidates.withColumn("created_at", current_timestamp())
+    pbt_candidates = pbt_candidates.withColumn("updated_at", current_timestamp())
+    pbt_candidates = pbt_candidates.withColumn("_pbt_match_key", _pbt_match_key_expr())
+    existing_pbt = existing_context.get("pbt")
+    if existing_pbt is not None:
+        existing_pbt = existing_pbt.select(
+            col("pbt_id").cast("int").alias("pbt_id"),
+            col("pbt_name"),
+            col("boundary_geom"),
+            col("is_active"),
+            col("created_at"),
+            col("updated_at"),
+        ).dropDuplicates(["pbt_id", "pbt_name"])
+        existing_pbt = existing_pbt.withColumn("_pbt_match_key", _pbt_match_key_expr())
+        pbt_new = pbt_candidates.join(
+            existing_pbt.select("_pbt_match_key"),
+            "_pbt_match_key",
+            "leftanti",
+        ).drop("_pbt_match_key")
+        pbt_table = existing_pbt.drop("_pbt_match_key").unionByName(pbt_new, allowMissingColumns=True)
+        pbt_write = pbt_new.select("pbt_id", "pbt_name", "boundary_geom", "is_active", "created_at", "updated_at")
+    else:
+        pbt_table = pbt_candidates.drop("_pbt_match_key")
+        pbt_write = pbt_table.select("pbt_id", "pbt_name", "boundary_geom", "is_active", "created_at", "updated_at")
 
     street_base = df.select(
         col("street_name_prefix"),
@@ -469,19 +817,74 @@ def _build_normalized_tables(
         when(col("pbt_id").rlike(r"^\\d+$"), col("pbt_id").cast("int")).alias("pbt_id"),
     ).filter(col("street_name").isNotNull())
     street_base = street_base.join(locality_table, ["locality_name", "mukim_id"], "left")
-    street_table = street_base.dropDuplicates(["street_name_prefix", "street_name", "locality_id", "pbt_id"])
-    street_table = street_table.withColumn(
-        "street_id",
-        row_number().over(
-            Window.orderBy(
-                col("street_name").asc_nulls_last(),
-                col("locality_id").asc_nulls_last(),
-                col("pbt_id").asc_nulls_last(),
-            )
-        ),
-    )
-    street_table = street_table.withColumn("created_at", current_timestamp())
-    street_table = street_table.withColumn("updated_at", current_timestamp())
+    street_candidates = street_base.dropDuplicates(["street_name_prefix", "street_name", "locality_id", "pbt_id"])
+    street_candidates = street_candidates.withColumn("_street_match_key", _street_match_key_expr())
+    existing_street = existing_context.get("street")
+    if existing_street is not None:
+        existing_street = existing_street.select(
+            col("street_id").cast("int").alias("street_id"),
+            col("street_name_prefix"),
+            col("street_name"),
+            col("locality_id").cast("int").alias("locality_id"),
+            col("pbt_id").cast("int").alias("pbt_id"),
+            col("created_at"),
+            col("updated_at"),
+        ).dropDuplicates(["street_id"])
+        existing_street = existing_street.withColumn("_street_match_key", _street_match_key_expr())
+        street_new = street_candidates.join(
+            existing_street.select("_street_match_key"),
+            "_street_match_key",
+            "leftanti",
+        ).drop("_street_match_key")
+        street_new = street_new.withColumn(
+            "street_id",
+            lit(_max_value(existing_street, "street_id"))
+            + row_number().over(
+                Window.orderBy(
+                    col("street_name").asc_nulls_last(),
+                    col("locality_id").asc_nulls_last(),
+                    col("pbt_id").asc_nulls_last(),
+                )
+            ),
+        )
+        street_new = street_new.withColumn("created_at", current_timestamp())
+        street_new = street_new.withColumn("updated_at", current_timestamp())
+        street_table = existing_street.drop("_street_match_key").unionByName(
+            street_new.select("street_name_prefix", "street_name", "locality_id", "pbt_id", "street_id", "created_at", "updated_at"),
+            allowMissingColumns=True,
+        )
+        street_write = street_new.select(
+            "street_id",
+            "street_name_prefix",
+            "street_name",
+            "locality_id",
+            "pbt_id",
+            "created_at",
+            "updated_at",
+        )
+    else:
+        street_table = street_candidates.drop("_street_match_key")
+        street_table = street_table.withColumn(
+            "street_id",
+            row_number().over(
+                Window.orderBy(
+                    col("street_name").asc_nulls_last(),
+                    col("locality_id").asc_nulls_last(),
+                    col("pbt_id").asc_nulls_last(),
+                )
+            ),
+        )
+        street_table = street_table.withColumn("created_at", current_timestamp())
+        street_table = street_table.withColumn("updated_at", current_timestamp())
+        street_write = street_table.select(
+            "street_id",
+            "street_name_prefix",
+            "street_name",
+            "locality_id",
+            "pbt_id",
+            "created_at",
+            "updated_at",
+        )
 
     # StandardizedAddress
     addr = df.withColumn("locality_name", _normalize_locality_col(col("locality_name")))
@@ -598,13 +1001,7 @@ def _build_normalized_tables(
         sha2(coalesce(col("address_clean"), lit("")), 256),
     )
 
-    addr = addr.withColumn(
-        "address_id",
-        row_number().over(Window.orderBy(monotonically_increasing_id())),
-    )
-
-    standardized_address = addr.select(
-        col("address_id").cast("int"),
+    standardized_address_candidate = addr.select(
         col("premise_no"),
         col("building_name"),
         col("floor_level"),
@@ -629,8 +1026,108 @@ def _build_normalized_tables(
         lit(None).cast("int").alias("validation_by"),
         col("checksum"),
     )
+    standardized_address_candidate = standardized_address_candidate.withColumn(
+        "identity_fingerprint",
+        _address_identity_fingerprint_expr(),
+    )
+    # Collapse duplicate canonical addresses within the same batch before
+    # allocating persistent IDs or generating standard NASKOD rows.
+    standardized_address_candidate = standardized_address_candidate.dropDuplicates(["identity_fingerprint"])
+    existing_standardized = existing_context.get("standardized_address")
+    next_address_id_start = 0
+    if existing_standardized is not None:
+        existing_standardized = existing_standardized.select(
+            col("address_id").cast("int").alias("address_id"),
+            col("premise_no"),
+            col("building_name"),
+            col("floor_level"),
+            col("unit_no"),
+            col("lot_no"),
+            col("street_id").cast("int").alias("street_id"),
+            col("locality_id").cast("int").alias("locality_id"),
+            col("mukim_id").cast("int").alias("mukim_id"),
+            col("district_id").cast("int").alias("district_id"),
+            col("state_id").cast("int").alias("state_id"),
+            col("postcode_id").cast("int").alias("postcode_id"),
+            col("country"),
+            col("pbt_id").cast("int").alias("pbt_id"),
+            col("validation_status"),
+            col("validation_date"),
+            col("validation_by").cast("int").alias("validation_by"),
+            col("checksum"),
+        )
+        existing_standardized = existing_standardized.withColumn(
+            "identity_fingerprint",
+            _address_identity_fingerprint_expr(),
+        )
+        existing_by_checksum = existing_standardized.select(
+            col("checksum"),
+            col("address_id").alias("_existing_address_id_by_checksum"),
+        ).filter(col("checksum").isNotNull()).dropDuplicates(["checksum"])
+        existing_by_fingerprint = existing_standardized.select(
+            col("identity_fingerprint"),
+            col("address_id").alias("_existing_address_id_by_fingerprint"),
+        ).dropDuplicates(["identity_fingerprint"])
+        standardized_address_candidate = standardized_address_candidate.join(
+            existing_by_checksum,
+            "checksum",
+            "left",
+        )
+        standardized_address_candidate = standardized_address_candidate.join(
+            existing_by_fingerprint,
+            "identity_fingerprint",
+            "left",
+        )
+        standardized_address_candidate = standardized_address_candidate.withColumn(
+            "_existing_address_id",
+            coalesce(
+                col("_existing_address_id_by_checksum"),
+                col("_existing_address_id_by_fingerprint"),
+            ),
+        )
+        next_address_id_start = _max_value(existing_standardized, "address_id")
+    standardized_address_new = standardized_address_candidate.filter(
+        col("_existing_address_id").isNull() if "_existing_address_id" in standardized_address_candidate.columns else lit(True)
+    )
+    standardized_address_new = standardized_address_new.drop(
+        "identity_fingerprint",
+        "_existing_address_id",
+        "_existing_address_id_by_checksum",
+        "_existing_address_id_by_fingerprint",
+    )
+    standardized_address_new = standardized_address_new.withColumn(
+        "address_id",
+        lit(next_address_id_start)
+        + row_number().over(Window.orderBy(monotonically_increasing_id())),
+    )
+    standardized_address = standardized_address_new.select(
+        col("address_id").cast("int"),
+        col("premise_no"),
+        col("building_name"),
+        col("floor_level"),
+        col("unit_no"),
+        col("lot_no"),
+        col("street_id").cast("int"),
+        col("locality_id").cast("int"),
+        col("mukim_id").cast("int"),
+        col("district_id").cast("int"),
+        col("state_id").cast("int"),
+        col("postcode_id").cast("int"),
+        col("country"),
+        col("pbt_id").cast("int"),
+        col("latitude").cast("double"),
+        col("longitude").cast("double"),
+        col("geom"),
+        col("created_at"),
+        col("updated_at"),
+        col("address_type_id").cast("int"),
+        col("validation_status"),
+        col("validation_date"),
+        col("validation_by").cast("int"),
+        col("checksum"),
+    )
 
-    # NASKod generation (standard codes)
+    # NASKod generation (standard codes for newly inserted addresses only)
     state_abbr_map = {
         "01": "JHR",
         "02": "KDH",
@@ -665,9 +1162,32 @@ def _build_normalized_tables(
         when(col("state_abbr").isNull() & col("state_code").rlike(r"^[A-Z]{2,3}$"), col("state_code"))
         .otherwise(col("state_abbr")),
     )
+    existing_naskod = existing_context.get("naskod")
+    next_naskod_id_start = 0
+    if existing_naskod is not None:
+        next_naskod_id_start = _max_value(existing_naskod, "naskod_id")
+        existing_naskod_max = (
+            existing_naskod.filter(col("is_vanity") == lit(False))
+            .withColumn("state_abbr", split(col("code"), "-").getItem(1))
+            .withColumn("district_code", split(col("code"), "-").getItem(2))
+            .withColumn("suffix_num", split(col("code"), "-").getItem(3).cast("int"))
+            .groupBy("state_abbr", "district_code")
+            .agg(spark_max(col("suffix_num")).alias("existing_max_suffix"))
+        )
+        naskod_base = naskod_base.join(
+            existing_naskod_max,
+            ["state_abbr", "district_code"],
+            "left",
+        )
+    else:
+        naskod_base = naskod_base.withColumn("existing_max_suffix", lit(0))
     naskod_seq = Window.partitionBy("state_abbr", "district_code").orderBy(col("address_id").asc_nulls_last())
     naskod_base = naskod_base.withColumn("seq", row_number().over(naskod_seq))
-    naskod_base = naskod_base.withColumn("suffix", lpad(col("seq").cast("string"), 6, "0"))
+    naskod_base = naskod_base.withColumn(
+        "suffix_num",
+        coalesce(col("existing_max_suffix"), lit(0)) + col("seq"),
+    )
+    naskod_base = naskod_base.withColumn("suffix", lpad(col("suffix_num").cast("string"), 6, "0"))
     naskod_base = naskod_base.withColumn(
         "code",
         when(
@@ -684,7 +1204,7 @@ def _build_normalized_tables(
     naskod = naskod.withColumn("verified", lit(False))
     naskod = naskod.withColumn(
         "naskod_id",
-        row_number().over(Window.orderBy(col("address_id").asc_nulls_last())),
+        lit(next_naskod_id_start) + row_number().over(Window.orderBy(col("address_id").asc_nulls_last())),
     )
     naskod = naskod.select(
         col("naskod_id").cast("int"),
@@ -700,7 +1220,7 @@ def _build_normalized_tables(
         "state": state_table.select("state_id", "state_name", "state_code"),
         "district": district_table.select("district_id", "district_name", "state_id", "district_code"),
         "mukim": mukim_table.select("mukim_id", "mukim_name", "district_id", "mukim_code"),
-        "locality": locality_table.select(
+        "locality": locality_write.select(
             "locality_id",
             "locality_code",
             "locality_name",
@@ -709,15 +1229,8 @@ def _build_normalized_tables(
             "updated_at",
         ),
         "postcode": postcode_table,
-        "pbt": pbt_table.select(
-            "pbt_id",
-            "pbt_name",
-            "boundary_geom",
-            "is_active",
-            "created_at",
-            "updated_at",
-        ),
-        "street": street_table.select(
+        "pbt": pbt_write.select("pbt_id", "pbt_name", "boundary_geom", "is_active", "created_at", "updated_at"),
+        "street": street_write.select(
             "street_id",
             "street_name_prefix",
             "street_name",
@@ -726,12 +1239,7 @@ def _build_normalized_tables(
             "created_at",
             "updated_at",
         ),
-        "address_type": address_type_table.select(
-            "address_type_id",
-            "property_type",
-            "property_code",
-            "ownership_structure",
-        ),
+        "address_type": address_type_write.select("address_type_id", "property_type", "property_code", "ownership_structure"),
         "naskod": naskod,
         "standardized_address": standardized_address,
     }
@@ -747,12 +1255,14 @@ def main() -> None:
     status = "ok"
     try:
         builder = SparkSession.builder.appName("NAS Load Postgres")
+        builder = configure_common_spark_builder(builder)
         builder = configure_sedona_builder(builder)
         jars_packages = resolve_sedona_spark_packages()
         jars_packages = merge_spark_packages(jars_packages, "org.postgresql:postgresql:42.7.3")
         if jars_packages:
             builder = builder.config("spark.jars.packages", jars_packages)
         spark = builder.getOrCreate()
+        quiet_spark_spatial_warnings(spark)
 
         df = spark.read.parquet(args.input)
         if args.repartition and args.repartition > 0:
@@ -829,6 +1339,13 @@ def main() -> None:
                     requested_pbt_dir=args.pbt_dir,
                 )
 
+            existing_context = _load_existing_normalized_state(
+                spark,
+                jdbc_url=jdbc_url,
+                user=args.user,
+                password=args.password,
+                schema=schema_for_check,
+            )
             tables = _build_normalized_tables(
                 df,
                 spark=spark,
@@ -836,6 +1353,7 @@ def main() -> None:
                 pbt_boundaries=pbt_boundaries,
                 pbt_id_column=args.pbt_id_column,
                 pbt_name_column=args.pbt_name_column,
+                existing_context=existing_context,
             )
             source_locality_count = (
                 df.select(trim(col("locality_name")).alias("_locality_name"))
@@ -885,19 +1403,23 @@ def main() -> None:
             )
             _write_table(tables["mukim"], jdbc_url=jdbc_url, table=f"{schema_qual}mukim", mode=dim_mode, props=props)
             _write_table(
-                tables["locality"], jdbc_url=jdbc_url, table=f"{schema_qual}locality", mode=dim_mode, props=props
-            )
-            _write_table(
                 tables["postcode"], jdbc_url=jdbc_url, table=f"{schema_qual}postcode", mode=dim_mode, props=props
             )
-            _write_table(tables["pbt"], jdbc_url=jdbc_url, table=f"{schema_qual}pbt", mode=dim_mode, props=props)
-            _write_table(
-                tables["street"], jdbc_url=jdbc_url, table=f"{schema_qual}street", mode=dim_mode, props=props
+            _write_table_if_has_rows(
+                tables["pbt"], jdbc_url=jdbc_url, table=f"{schema_qual}pbt", mode="append", props=props
             )
-            _write_table(
-                tables["address_type"], jdbc_url=jdbc_url, table=f"{schema_qual}address_type", mode=dim_mode, props=props
+            _write_table_if_has_rows(
+                tables["street"], jdbc_url=jdbc_url, table=f"{schema_qual}street", mode="append", props=props
             )
-            _write_table(tables["naskod"], jdbc_url=jdbc_url, table=f"{schema_qual}naskod", mode=dim_mode, props=props)
+            _write_table_if_has_rows(
+                tables["address_type"], jdbc_url=jdbc_url, table=f"{schema_qual}address_type", mode="append", props=props
+            )
+            _write_table_if_has_rows(
+                tables["locality"], jdbc_url=jdbc_url, table=f"{schema_qual}locality", mode="append", props=props
+            )
+            _write_table_if_has_rows(
+                tables["naskod"], jdbc_url=jdbc_url, table=f"{schema_qual}naskod", mode="append", props=props
+            )
             geom_udt_name = _get_column_udt_name(
                 spark,
                 jdbc_url=jdbc_url,
@@ -908,17 +1430,18 @@ def main() -> None:
                 column="geom",
             )
             if args.mode == "append" and geom_udt_name == "geometry":
-                _append_standardized_address_with_geom_cast(
-                    spark,
-                    df=tables["standardized_address"],
-                    jdbc_url=jdbc_url,
-                    props=props,
-                    user=args.user,
-                    password=args.password,
-                    schema_qual=schema_qual,
-                )
+                if _df_has_rows(tables["standardized_address"]):
+                    _append_standardized_address_with_geom_cast(
+                        spark,
+                        df=tables["standardized_address"],
+                        jdbc_url=jdbc_url,
+                        props=props,
+                        user=args.user,
+                        password=args.password,
+                        schema_qual=schema_qual,
+                    )
             else:
-                _write_table(
+                _write_table_if_has_rows(
                     tables["standardized_address"],
                     jdbc_url=jdbc_url,
                     table=f"{schema_qual}standardized_address",

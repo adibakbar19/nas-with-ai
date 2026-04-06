@@ -19,11 +19,17 @@ Core modules still follow layered separation:
 - `PGHOST`, `PGPORT`, `PGDATABASE`, `PGUSER`, `PGPASSWORD`, `PGSCHEMA`
 - `POSTCODE_BOUNDARY_TABLE` (default `postcode_boundary`)
 - `ES_URL`, `ES_INDEX`
-- `QUEUE_BACKEND` (`log` or `sqs`)
+- `QUEUE_BACKEND` (`redis_stream`, `log`, or `sqs`)
 - `QUEUE_EVENT_LOG` (default `logs/queue/bulk_ingest_events.jsonl`)
 - `QUEUE_OFFSET_FILE` (default `logs/queue/bulk_ingest_events.offset`)
 - `INGEST_EXECUTION_MODE` (`local_thread` or `queue_worker`)
 - `SQS_QUEUE_URL` (required when `QUEUE_BACKEND=sqs`)
+- `REDIS_URL` (required when `QUEUE_BACKEND=redis_stream`)
+- `REDIS_STREAM_KEY` (default `bulk_ingest_events`)
+- `REDIS_STREAM_GROUP` (default `bulk_ingest_workers`)
+- `REDIS_STREAM_BLOCK_MS` (default `5000`)
+- `REDIS_STREAM_CLAIM_IDLE_MS` (default `60000`, reclaim stale pending messages after 60s idle)
+- `REDIS_STREAM_CLAIM_COUNT` (default `10`, max stale pending messages to reclaim per poll)
 - `AWS_REGION` (default `ap-southeast-5`)
 
 ## Worker Run

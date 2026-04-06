@@ -9,7 +9,6 @@ Quick runbook: see `docs/RUN_PIPELINE.md`.
 etl/        core data pipeline package
 backend/    FastAPI backend
 domain/     shared pure business rules (API/ETL/worker)
-frontend/   legacy static UI
 frontend-vue/ Vue 3 app (separate deploy)
 config/     pipeline configs
 data/       inputs, lookups, boundaries
@@ -159,9 +158,8 @@ Flow notes:
 - `backend/app/main.py`: FastAPI backend (`/api/v1/health`, `/api/v1/search/autocomplete`, `/api/v1/jobs`).
 - `backend/app/services/ingest_service.py`: ingest orchestration service layer.
 - `backend/app/services/address_read_service.py`: database read service layer for Postgres lookup endpoints.
-- `backend/app/queue/producer.py`: async queue producer abstraction + SQS/log implementations.
+- `backend/app/queue/producer.py`: async queue producer abstraction + Redis Stream/SQS/log implementations.
 - `backend/app/workers/queue_consumer.py`: async worker consumer example.
-- `frontend/`: legacy static UI.
 - `frontend-vue/`: standalone Vue 3 UI for separate bucket/CDN deployment.
 - `run_all.sh`: one-step script to run pipeline + load.
 - `docker-compose.yml`: PostGIS + optional Elasticsearch (`search`) + MinIO (`objectstore`) profiles.
@@ -232,6 +230,16 @@ Start PostGIS:
 docker compose up -d postgres
 ```
 
+Local connection note:
+- Docker Postgres is exposed on host port `5433` to avoid collisions with a separate local Postgres that may already use `5432`.
+- Use `localhost:5433` from host tools such as `psql`, pgAdmin, or DBeaver.
+- Inside Docker, services still connect to `postgres:5432`.
+
+Example host-side check:
+```bash
+PGPASSWORD=postgres psql -h localhost -p 5433 -U postgres -d postgres -c 'select current_user;'
+```
+
 If you need to recreate the database:
 ```bash
 docker compose down -v
@@ -241,7 +249,7 @@ docker compose up -d postgres
 ## Elasticsearch (Optional)
 Start Elasticsearch:
 ```bash
-docker compose --profile search up -d elasticsearch
+docker compose up -d elasticsearch
 ```
 
 Index cleaned output:
@@ -264,13 +272,16 @@ venv/bin/python search_elasticsearch.py \
 ## MinIO (Upload Object Store)
 Start MinIO:
 ```bash
-docker compose --profile objectstore up -d minio
+docker compose up -d minio
 ```
 
 Default endpoints:
 - API: `http://localhost:9000`
 - Console: `http://localhost:9001`
 - Credentials are read from `.env` (`MINIO_ACCESS_KEY` / `MINIO_SECRET_KEY`).
+- Browser multipart uploads use `MINIO_PUBLIC_ENDPOINT`. Set it to a host/IP that the browser can actually reach.
+  - Local-only example: `MINIO_PUBLIC_ENDPOINT=localhost:9000`
+  - LAN example: `MINIO_PUBLIC_ENDPOINT=192.168.x.x:9000`
 
 ## Backend API
 Run API server:
@@ -280,6 +291,11 @@ uvicorn backend.app.main:app --host 0.0.0.0 --port 8000 --reload
 Backend checks required env vars at startup. Disable only for local troubleshooting:
 ```bash
 STRICT_ENV_CHECK=false uvicorn backend.app.main:app --host 0.0.0.0 --port 8000 --reload
+```
+When `config/config.json` uses DB-backed lookups or boundaries, backend startup also verifies that the
+required `nas_lookup` tables already exist. Disable only for local troubleshooting:
+```bash
+STRICT_LOOKUP_DB_CHECK=false uvicorn backend.app.main:app --host 0.0.0.0 --port 8000 --reload
 ```
 
 Run worker (required when `INGEST_EXECUTION_MODE=queue_worker`):
@@ -302,25 +318,38 @@ Available API endpoints:
 - `GET /api/v1/search/autocomplete?q=jalan%20perdana&size=10`
 - `GET /api/v1/jobs?limit=20`
 - `GET /api/v1/jobs/{run_id}`
-- `POST /api/v1/ingest/upload` (multipart file upload to MinIO + optional processing)
+- `POST /api/v1/ingest/upload` (direct multipart/form-data upload for small/medium files)
+- `POST /api/v1/ingest/uploads/multipart/initiate`
+- `GET /api/v1/ingest/uploads/multipart/{session_id}`
+- `POST /api/v1/ingest/uploads/multipart/{session_id}/part-url`
+- `POST /api/v1/ingest/uploads/multipart/{session_id}/complete`
+- `POST /api/v1/ingest/uploads/multipart/{session_id}/abort`
 - `GET /api/v1/ingest/jobs?limit=20`
 - `GET /api/v1/ingest/jobs/{job_id}`
 - `POST /api/v1/ingest/jobs/{job_id}/start`
 - `POST /api/v1/ingest/jobs/{job_id}/pause`
 
 Upload + process flow:
-1. Frontend uploads file to backend.
-2. Backend stores file in MinIO bucket (`nas-uploads`).
-3. Backend queues ingest event (`QUEUE_BACKEND=log|sqs`).
-4. Worker consumes event and runs `pipeline.py` (and optional DB load).
-5. Job output written to `output/uploads/<job_id>/cleaned|failed`.
-6. Job log written to `logs/jobs/<job_id>.log`.
+1. For smaller files, frontend sends `POST /api/v1/ingest/upload` directly to the backend.
+2. For larger files, or when a saved resumable session exists, frontend uses the multipart upload flow.
+3. Multipart mode returns presigned part URLs so the browser can upload chunks directly to `nas-uploads`.
+4. Backend creates or completes the ingest job record and queues the event (`QUEUE_BACKEND=redis_stream|log|sqs`).
+5. Worker consumes the event and runs `pipeline.py` (and optional DB load).
+6. Job output written to `output/uploads/<job_id>/cleaned|failed`.
+7. Job log written to `logs/jobs/<job_id>.log`.
 
 Dockerized API + worker:
 ```bash
-docker compose --profile api up -d api
-docker compose --profile worker up -d worker
+docker compose up -d api worker
 ```
+
+Full Docker stack, including frontend and automatic lookup bootstrap:
+```bash
+docker compose -f docker-compose.yml -f docker-compose.frontend.yml up -d
+```
+This now waits for Postgres to become healthy, checks whether `nas_lookup.lookup_version` already exists,
+and only runs `bootstrap_lookups.py` on first-time setup. After that, `api` and `worker` start without
+rebuilding lookup tables on every restart.
 
 ## Transform + Validate Behavior
 The transform step expects a **full address string** in one column and performs:
@@ -399,6 +428,7 @@ Use a JSON config to customize which columns are treated as old/new addresses an
   "pbt_simplify_tolerance": 0.00005,
   "boundary_source": "db",
   "boundary_db_schema": "nas_lookup",
+  "pbt_boundary_table": "pbt",
   "state_boundary_table": "state_boundary",
   "district_boundary_table": "district_boundary",
   "mukim_boundary_table": "mukim_boundary",
@@ -427,10 +457,12 @@ Run with:
 python pipeline.py --input data/raw/ --config config/address_aliases.json --success output/cleaned/ --failed output/failed/
 ```
 
-If spatial joins are heavy on local laptop, run with larger Spark memory:
+For local Docker/Desktop runs, start with conservative Spark memory:
 ```bash
-SPARK_DRIVER_MEMORY=6g SPARK_EXECUTOR_MEMORY=6g SPARK_SQL_SHUFFLE_PARTITIONS=64 bash run_all.sh
+SPARK_DRIVER_MEMORY=2g SPARK_EXECUTOR_MEMORY=2g SPARK_SQL_SHUFFLE_PARTITIONS=16 bash run_all.sh
 ```
+
+Increase these only after raising Docker Desktop memory; otherwise Spark can OOM-kill the worker JVM.
 
 You can also define text replacements to normalize common address terms:
 ```json
@@ -474,6 +506,7 @@ venv/bin/python bootstrap_lookups.py \
 Then switch ETL lookup + boundary mode in `config/config.json`:
 - `"lookup_source": "db"`
 - `"boundary_source": "db"`
+- `"pbt_boundary_table": "pbt"`
 - keep `"lookup_cache_enabled": true` for versioned parquet cache reuse.
 
 ## NASKod (Standard + Vanity)

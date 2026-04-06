@@ -18,6 +18,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from minio import Minio
 from etl.env_check import validate_backend_env
 from backend.app.dependencies import get_queue_producer
+from backend.app.repositories.ingest_job_state_repository import IngestJobStateRepository, psycopg
 from backend.app.schemas.ingest import BulkIngestEvent
 
 
@@ -28,6 +29,7 @@ JOB_STATE_FILE = PROJECT_ROOT / "logs" / "ingest_jobs_state.json"
 UPLOAD_STAGING_DIR = PROJECT_ROOT / "data" / "uploads"
 OUTPUT_UPLOADS_DIR = PROJECT_ROOT / "output" / "uploads"
 ENV_FILE = PROJECT_ROOT / ".env"
+DEFAULT_INGEST_CONFIG_PATH = Path(os.getenv("INGEST_DEFAULT_CONFIG_PATH", "config/config.json"))
 
 
 def _load_env_file(env_file: Path) -> None:
@@ -68,6 +70,14 @@ INGEST_PERSIST_LIVE_INTERVAL_SECONDS = max(
     0.5,
     float(os.getenv("INGEST_PERSIST_LIVE_INTERVAL_SECONDS", "2.0")),
 )
+INGEST_STALE_CLAIM_SECONDS = max(
+    30,
+    int(os.getenv("INGEST_STALE_CLAIM_SECONDS", "300")),
+)
+INGEST_STALE_CLAIM_RECOVERY_INTERVAL_SECONDS = max(
+    5,
+    int(os.getenv("INGEST_STALE_CLAIM_RECOVERY_INTERVAL_SECONDS", "30")),
+)
 AUDIT_LOG_PATH = Path(os.getenv("NAS_AUDIT_LOG", "logs/nas_audit.log"))
 MINIO_ENDPOINT = os.getenv("MINIO_ENDPOINT", "localhost:9000")
 MINIO_ACCESS_KEY = os.getenv("MINIO_ACCESS_KEY")
@@ -75,12 +85,129 @@ MINIO_SECRET_KEY = os.getenv("MINIO_SECRET_KEY")
 MINIO_SECURE = os.getenv("MINIO_SECURE", "false").lower() in {"1", "true", "yes", "y"}
 MINIO_BUCKET = os.getenv("MINIO_BUCKET", "nas-uploads")
 INGEST_EXECUTION_MODE = os.getenv("INGEST_EXECUTION_MODE", "local_thread").strip().lower()
+INGEST_JOB_STATE_DSN = os.getenv(
+    "INGEST_JOB_STATE_DSN",
+    os.getenv(
+        "POSTGRES_DSN",
+        "postgresql://"
+        f"{os.getenv('PGUSER', 'postgres')}:{os.getenv('PGPASSWORD', 'postgres')}"
+        f"@{os.getenv('PGHOST', 'localhost')}:{os.getenv('PGPORT', '5432')}"
+        f"/{os.getenv('PGDATABASE', 'postgres')}",
+    ),
+)
+INGEST_JOB_STATE_SCHEMA = (
+    os.getenv("INGEST_JOB_STATE_SCHEMA")
+    or os.getenv("PGSCHEMA")
+    or "nas"
+).strip()
+STRICT_LOOKUP_DB_CHECK = os.getenv("STRICT_LOOKUP_DB_CHECK", "1").lower() in {"1", "true", "yes", "y"}
 CORS_ALLOW_ORIGINS = _parse_cors_origins(
     os.getenv(
         "CORS_ALLOW_ORIGINS",
         "http://localhost:3000,http://localhost:5173,https://admin.alamat.gov.my",
     )
 )
+
+
+def _resolve_project_path(raw_path: str | Path) -> Path:
+    path = Path(raw_path)
+    if not path.is_absolute():
+        path = PROJECT_ROOT / path
+    return path
+
+
+def _config_bool(config: dict[str, Any], key: str, default: bool) -> bool:
+    value = config.get(key, default)
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"1", "true", "yes", "y", "on"}:
+            return True
+        if normalized in {"0", "false", "no", "n", "off"}:
+            return False
+    return bool(value)
+
+
+def _load_ingest_config(config_path: str | Path = DEFAULT_INGEST_CONFIG_PATH) -> tuple[Path, dict[str, Any]]:
+    resolved = _resolve_project_path(config_path)
+    if not resolved.exists():
+        raise RuntimeError(
+            f"Ingest config not found: {resolved}. "
+            "Update INGEST_DEFAULT_CONFIG_PATH or restore the config file."
+        )
+    try:
+        payload = json.loads(resolved.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise RuntimeError(f"Unable to read ingest config {resolved}: {exc}") from exc
+    if not isinstance(payload, dict):
+        raise RuntimeError(f"Ingest config must be a JSON object: {resolved}")
+    return resolved, payload
+
+
+def _required_lookup_tables(config: dict[str, Any]) -> tuple[str, set[str]]:
+    lookup_source = str(config.get("lookup_source", "files")).strip().lower()
+    boundary_source = str(config.get("boundary_source", "files")).strip().lower()
+    schema = (
+        str(
+            config.get("lookup_db_schema")
+            or config.get("boundary_db_schema")
+            or os.getenv("LOOKUP_SCHEMA")
+            or os.getenv("PGSCHEMA")
+            or "nas_lookup"
+        ).strip()
+        or "nas_lookup"
+    )
+    required: set[str] = set()
+
+    if lookup_source == "db":
+        required.update(
+            {
+                "state",
+                "district",
+                "mukim",
+                "locality",
+                "sublocality",
+                "postcode",
+                "lookup_version",
+            }
+        )
+
+    if boundary_source == "db":
+        if _config_bool(config, "admin_boundary_enabled", True):
+            required.update({"state_boundary", "district_boundary", "mukim_boundary"})
+        if _config_bool(config, "postcode_boundary_enabled", True):
+            required.add(str(config.get("postcode_boundary_table", "postcode_boundary")).strip() or "postcode_boundary")
+        if _config_bool(config, "pbt_enabled", True):
+            required.add(str(config.get("pbt_boundary_table", "pbt")).strip() or "pbt")
+
+    return schema, required
+
+
+def _validate_lookup_db_bootstrap(config_path: str | Path = DEFAULT_INGEST_CONFIG_PATH) -> None:
+    config_file, config = _load_ingest_config(config_path)
+    schema, required_tables = _required_lookup_tables(config)
+    if not required_tables:
+        return
+    if psycopg is None:
+        raise RuntimeError("psycopg is required for DB-backed lookup validation")
+
+    with psycopg.connect(INGEST_JOB_STATE_DSN) as conn, conn.cursor() as cur:
+        cur.execute(
+            "SELECT table_name FROM information_schema.tables WHERE table_schema = %s",
+            (schema,),
+        )
+        existing_tables = {str(row[0]) for row in cur.fetchall()}
+
+    missing_tables = sorted(required_tables - existing_tables)
+    if missing_tables:
+        raise RuntimeError(
+            "DB-backed lookup/boundary mode is enabled, but required lookup tables are missing. "
+            f"config={config_file} schema={schema} missing={', '.join(missing_tables)}. "
+            "Run bootstrap_lookups.py against the live Postgres database before starting api/worker."
+)
+if STRICT_LOOKUP_DB_CHECK:
+    _validate_lookup_db_bootstrap()
 
 
 app = FastAPI(title="NAS API", version="0.1.0")
@@ -96,6 +223,8 @@ INGEST_JOBS: dict[str, dict[str, Any]] = {}
 INGEST_JOBS_LOCK = threading.Lock()
 INGEST_PROCS: dict[str, dict[str, Any]] = {}
 INGEST_PROCS_LOCK = threading.Lock()
+JOB_STATE_REPOSITORY_LOCK = threading.Lock()
+JOB_STATE_REPOSITORY: IngestJobStateRepository | None = None
 _ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
 
 
@@ -126,44 +255,47 @@ def _infer_source_type(filename: str) -> str:
     return "csv"
 
 
-def _persist_jobs_state_unlocked() -> None:
-    JOB_STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
-    snapshot = list(INGEST_JOBS.values())
-    JOB_STATE_FILE.write_text(json.dumps(snapshot, ensure_ascii=True, indent=2), encoding="utf-8")
+def _get_job_state_repository() -> IngestJobStateRepository:
+    global JOB_STATE_REPOSITORY
+    if JOB_STATE_REPOSITORY is not None:
+        return JOB_STATE_REPOSITORY
+    with JOB_STATE_REPOSITORY_LOCK:
+        if JOB_STATE_REPOSITORY is None:
+            repository = IngestJobStateRepository(
+                dsn=INGEST_JOB_STATE_DSN,
+                schema=INGEST_JOB_STATE_SCHEMA,
+            )
+            repository.ensure_table()
+            JOB_STATE_REPOSITORY = repository
+    return JOB_STATE_REPOSITORY
 
 
-def _set_job(job_id: str, *, persist: bool = True, **changes: Any) -> None:
-    with INGEST_JOBS_LOCK:
-        if job_id not in INGEST_JOBS:
-            INGEST_JOBS[job_id] = {"job_id": job_id}
-        INGEST_JOBS[job_id].update(changes)
-        if persist:
-            _persist_jobs_state_unlocked()
-
-
-def _load_jobs_state() -> None:
+def _read_legacy_jobs_state_file() -> list[dict[str, Any]]:
     if not JOB_STATE_FILE.exists():
-        return
+        return []
     try:
         rows = json.loads(JOB_STATE_FILE.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
-        return
+        return []
     if not isinstance(rows, list):
-        return
+        return []
+    return [row for row in rows if isinstance(row, dict)]
+
+
+def _recover_jobs_state_rows(rows: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
     restored: dict[str, dict[str, Any]] = {}
     now = _now_iso()
     now_ts = datetime.now(timezone.utc).timestamp()
     for row in rows:
-        if not isinstance(row, dict):
-            continue
         job_id = str(row.get("job_id") or "").strip()
         if not job_id:
             continue
-        status = str(row.get("status") or "").lower()
+        recovered = dict(row)
+        status = str(recovered.get("status") or "").lower()
         if status in {"running", "queued", "pausing"}:
             keep_running = False
             if status == "running":
-                log_path_value = row.get("log_path")
+                log_path_value = recovered.get("log_path")
                 if log_path_value:
                     log_path = Path(str(log_path_value))
                     if log_path.exists():
@@ -174,68 +306,161 @@ def _load_jobs_state() -> None:
                         if modified_ago <= RUNNING_RECOVERY_WINDOW_SECONDS:
                             keep_running = True
             if keep_running:
-                row["status"] = "running"
-                row.setdefault("progress_stage", "starting")
-                row.setdefault("ended_at", None)
-                row.setdefault("error", None)
+                recovered["status"] = "running"
+                recovered.setdefault("progress_stage", "starting")
+                recovered.setdefault("ended_at", None)
+                recovered.setdefault("error", None)
             else:
-                row["status"] = "interrupted"
-                row.setdefault("ended_at", now)
-                row.setdefault("error", "Backend restarted before job completion")
-                row["progress_stage"] = "interrupted"
-                if row.get("load_to_db"):
-                    row["load_status"] = "pending"
-        restored[job_id] = row
+                recovered["status"] = "interrupted"
+                recovered.setdefault("ended_at", now)
+                recovered.setdefault("error", "Backend restarted before job completion")
+                recovered["progress_stage"] = "interrupted"
+                if recovered.get("load_to_db"):
+                    recovered["load_status"] = "pending"
+        restored[job_id] = recovered
+    return restored
+
+
+def _cache_job_unlocked(job_id: str, state: dict[str, Any]) -> None:
+    cached = dict(state)
+    cached["job_id"] = job_id
+    INGEST_JOBS[job_id] = cached
+
+
+def _persist_job_state(job_id: str, state: dict[str, Any]) -> None:
+    repository = _get_job_state_repository()
+    repository.save_job(job_id=job_id, state=state)
+
+
+def _set_job(job_id: str, *, persist: bool = True, **changes: Any) -> None:
+    with INGEST_JOBS_LOCK:
+        current = dict(INGEST_JOBS.get(job_id) or {})
+        current["job_id"] = job_id
+        current.update(changes)
+        _cache_job_unlocked(job_id, current)
+        snapshot = dict(current)
+    if persist:
+        _persist_job_state(job_id, snapshot)
+
+
+def _load_jobs_state() -> None:
+    repository = _get_job_state_repository()
+    rows = repository.list_jobs()
+    if not rows:
+        rows = _read_legacy_jobs_state_file()
+    restored = _recover_jobs_state_rows(rows)
     with INGEST_JOBS_LOCK:
         INGEST_JOBS.clear()
         INGEST_JOBS.update(restored)
+    for job_id, row in restored.items():
+        _persist_job_state(job_id, row)
 
 
 def _get_job(job_id: str) -> dict[str, Any] | None:
     with INGEST_JOBS_LOCK:
         row = INGEST_JOBS.get(job_id)
-        return dict(row) if row else None
+    if row:
+        return dict(row)
+    persisted = _get_job_state_repository().get_job(job_id=job_id)
+    if persisted:
+        with INGEST_JOBS_LOCK:
+            _cache_job_unlocked(job_id, persisted)
+        return dict(persisted)
+    return None
+
+
+def _claim_job_for_worker(
+    job_id: str,
+    *,
+    worker_id: str,
+    queue_event_id: str | None = None,
+    queue_message_id: str | None = None,
+) -> dict[str, Any] | None:
+    repository = _get_job_state_repository()
+    claimed = repository.claim_job(
+        job_id=job_id,
+        worker_id=worker_id,
+        expected_statuses=("queued",),
+        queue_event_id=queue_event_id,
+        queue_message_id=queue_message_id,
+    )
+    if claimed:
+        with INGEST_JOBS_LOCK:
+            _cache_job_unlocked(job_id, claimed)
+        return dict(claimed)
+
+    latest = repository.get_job(job_id=job_id)
+    if latest:
+        with INGEST_JOBS_LOCK:
+            _cache_job_unlocked(job_id, latest)
+    return None
+
+
+def _recover_stale_claims_and_requeue(*, limit: int = 20) -> list[dict[str, Any]]:
+    if not INGEST_PERSIST_LIVE_UPDATES:
+        return []
+
+    repository = _get_job_state_repository()
+    recovered = repository.requeue_stale_claims(
+        stale_after_seconds=INGEST_STALE_CLAIM_SECONDS,
+        statuses=("running", "pausing"),
+        limit=limit,
+    )
+    if not recovered:
+        return []
+
+    for row in recovered:
+        job_id = str(row.get("job_id") or "").strip()
+        if not job_id:
+            continue
+        with INGEST_JOBS_LOCK:
+            _cache_job_unlocked(job_id, row)
+        try:
+            _queue_ingest_job(job_id)
+        except Exception as exc:
+            _set_job(
+                job_id,
+                status="failed",
+                ended_at=_now_iso(),
+                error=f"stale-claim recovery requeue failed: {exc}",
+                progress_stage="failed",
+                load_status="failed" if row.get("load_to_db") else "skipped",
+            )
+    return recovered
 
 
 def _list_jobs() -> list[dict[str, Any]]:
+    rows = _get_job_state_repository().list_jobs()
     with INGEST_JOBS_LOCK:
-        rows = [dict(v) for v in INGEST_JOBS.values()]
-    rows.sort(key=lambda x: x.get("created_at", ""), reverse=True)
+        for row in rows:
+            job_id = str(row.get("job_id") or "").strip()
+            if job_id:
+                _cache_job_unlocked(job_id, row)
     return rows
 
 
 def _read_jobs_state_snapshot() -> list[dict[str, Any]]:
-    if not JOB_STATE_FILE.exists():
-        return []
-    try:
-        rows = json.loads(JOB_STATE_FILE.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return []
-    if not isinstance(rows, list):
-        return []
-    parsed = [row for row in rows if isinstance(row, dict)]
-    parsed.sort(key=lambda x: x.get("created_at", ""), reverse=True)
-    return parsed
+    return _list_jobs()
+
+
+def _get_persisted_job(job_id: str) -> dict[str, Any] | None:
+    row = _get_job_state_repository().get_job(job_id=job_id)
+    if row:
+        with INGEST_JOBS_LOCK:
+            _cache_job_unlocked(job_id, row)
+        return row
+    return None
 
 
 def _get_job_for_api(job_id: str) -> dict[str, Any] | None:
-    if INGEST_EXECUTION_MODE == "queue_worker":
-        rows = _read_jobs_state_snapshot()
-        for row in rows:
-            if str(row.get("job_id") or "") == job_id:
-                return row
-        return None
+    row = _get_persisted_job(job_id)
+    if row:
+        return row
     return _get_job(job_id)
 
 
 def _queue_ingest_job(job_id: str) -> None:
-    job = _get_job(job_id)
-    if not job or not job.get("object_name"):
-        for row in _read_jobs_state_snapshot():
-            if str(row.get("job_id") or "") == job_id:
-                job = row
-                _set_job(job_id, persist=False, **{k: v for k, v in row.items() if k != "job_id"})
-                break
+    job = _get_persisted_job(job_id) or _get_job(job_id)
     if not job:
         raise RuntimeError(f"job_id not found: {job_id}")
     event = BulkIngestEvent(
@@ -293,15 +518,14 @@ def _request_pause(job_id: str) -> tuple[bool, str | None]:
 
 
 def _state_pause_requested(job_id: str) -> bool:
-    for row in _read_jobs_state_snapshot():
-        if str(row.get("job_id") or "") != job_id:
-            continue
-        status = str(row.get("status") or "").lower()
-        if status == "pausing":
-            return True
-        if bool(row.get("pause_requested")):
-            return True
+    row = _get_persisted_job(job_id) or _get_job(job_id)
+    if not row:
         return False
+    status = str(row.get("status") or "").lower()
+    if status == "pausing":
+        return True
+    if bool(row.get("pause_requested")):
+        return True
     return False
 
 
@@ -428,6 +652,8 @@ def _run_ingest_job(job_id: str) -> None:
         object_name = job["object_name"]
         file_name = job["file_name"]
         config_path = job.get("config_path") or "config/config.json"
+        if STRICT_LOOKUP_DB_CHECK:
+            _validate_lookup_db_bootstrap(config_path)
 
         local_input = UPLOAD_STAGING_DIR / job_id / file_name
         local_input.parent.mkdir(parents=True, exist_ok=True)

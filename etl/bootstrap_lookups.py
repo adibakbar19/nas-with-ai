@@ -40,8 +40,10 @@ from .load_postgres import (
     _write_table,
 )
 from .sedona_utils import (
+    configure_common_spark_builder,
     configure_sedona_builder,
     merge_spark_packages,
+    quiet_spark_spatial_warnings,
     register_sedona,
     resolve_sedona_spark_packages,
 )
@@ -65,8 +67,8 @@ def _load_env_file(env_file: Path) -> None:
         key = key.strip()
         value = value.strip().strip("'").strip('"')
         if key:
-            # Force .env precedence so bootstrap always uses project credentials/config.
-            os.environ[key] = value
+            # Preserve explicitly injected env vars (for example Docker service overrides).
+            os.environ.setdefault(key, value)
 
 
 def _build_jdbc_url(args: argparse.Namespace) -> str:
@@ -703,12 +705,14 @@ def main() -> None:
     spark = None
     try:
         builder = SparkSession.builder.appName("NAS Bootstrap Lookups")
+        builder = configure_common_spark_builder(builder)
         builder = configure_sedona_builder(builder)
         jars_packages = resolve_sedona_spark_packages()
         jars_packages = merge_spark_packages(jars_packages, "org.postgresql:postgresql:42.7.3")
         if jars_packages:
             builder = builder.config("spark.jars.packages", jars_packages)
         spark = builder.getOrCreate()
+        quiet_spark_spatial_warnings(spark)
 
         jdbc_url = _build_jdbc_url(args)
         props = {

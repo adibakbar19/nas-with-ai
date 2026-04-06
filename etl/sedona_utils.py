@@ -86,6 +86,27 @@ def configure_sedona_builder(builder: Any, *, enabled: bool = True) -> Any:
     )
 
 
+def configure_common_spark_builder(builder: Any) -> Any:
+    spark_driver_memory = os.getenv("SPARK_DRIVER_MEMORY", "").strip()
+    spark_executor_memory = os.getenv("SPARK_EXECUTOR_MEMORY", "").strip()
+    spark_shuffle_partitions = os.getenv("SPARK_SQL_SHUFFLE_PARTITIONS", "").strip()
+    spark_adaptive_enabled = os.getenv("SPARK_SQL_ADAPTIVE_ENABLED", "true").strip().lower()
+
+    if spark_driver_memory:
+        builder = builder.config("spark.driver.memory", spark_driver_memory)
+    if spark_executor_memory:
+        builder = builder.config("spark.executor.memory", spark_executor_memory)
+    if spark_shuffle_partitions:
+        builder = builder.config("spark.sql.shuffle.partitions", spark_shuffle_partitions)
+    if spark_adaptive_enabled in {"1", "true", "yes", "y"}:
+        builder = (
+            builder.config("spark.sql.adaptive.enabled", "true")
+            .config("spark.sql.adaptive.coalescePartitions.enabled", "true")
+            .config("spark.sql.adaptive.skewJoin.enabled", "true")
+        )
+    return builder
+
+
 def register_sedona(spark: Any) -> None:
     # Register Sedona SQL functions only once per SparkSession to avoid duplicate-function spam.
     if bool(getattr(spark, "_nas_sedona_registered", False)):
@@ -103,3 +124,30 @@ def register_sedona(spark: Any) -> None:
             ) from exc
         SedonaRegistrator.registerAll(spark)
     spark._nas_sedona_registered = True
+
+
+def quiet_spark_spatial_warnings(spark: Any) -> None:
+    # Sedona's shapefile datasource triggers verbose Spark warnings while probing companion files.
+    # They are noisy but harmless for our batch jobs, so keep them out of job logs.
+    if bool(getattr(spark, "_nas_spatial_warnings_quieted", False)):
+        return
+
+    logger_names = [
+        "org.apache.spark.sql.execution.streaming.FileStreamSink",
+        "org.apache.spark.sql.execution.WindowExec",
+    ]
+    try:
+        jvm = spark._jvm
+        configurator = jvm.org.apache.logging.log4j.core.config.Configurator
+        level = jvm.org.apache.logging.log4j.Level.ERROR
+        for logger_name in logger_names:
+            configurator.setLevel(logger_name, level)
+    except Exception:
+        try:
+            jvm = spark._jvm
+            level = jvm.org.apache.log4j.Level.ERROR
+            for logger_name in logger_names:
+                jvm.org.apache.log4j.Logger.getLogger(logger_name).setLevel(level)
+        except Exception:
+            return
+    spark._nas_spatial_warnings_quieted = True

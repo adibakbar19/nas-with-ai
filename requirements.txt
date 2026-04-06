@@ -11,3 +11,4 @@ minio
 python-multipart
 psycopg[binary]
 boto3
+redis

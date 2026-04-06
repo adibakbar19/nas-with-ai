@@ -1,7 +1,7 @@
 from functools import lru_cache
 
 from backend.app.core.settings import AppSettings, get_settings
-from backend.app.queue.producer import LoggingQueueProducer, QueueProducer, SQSQueueProducer
+from backend.app.queue.producer import LoggingQueueProducer, QueueProducer, RedisStreamQueueProducer, SQSQueueProducer
 from backend.app.repositories.address_read_repository import AddressReadRepository
 from backend.app.services.address_read_service import AddressReadService
 from backend.app.services.ingest_service import IngestService
@@ -25,6 +25,11 @@ def get_queue_producer() -> QueueProducer:
     settings: AppSettings = get_settings()
     if settings.queue_backend == "sqs":
         return SQSQueueProducer(queue_url=settings.sqs_queue_url, region=settings.aws_region)
+    if settings.queue_backend == "redis_stream":
+        return RedisStreamQueueProducer(
+            redis_url=settings.redis_url,
+            stream_key=settings.redis_stream_key,
+        )
     return LoggingQueueProducer(event_log_path=settings.queue_event_log)
 
 

@@ -4,6 +4,7 @@ __pycache__/
 venv/
 node_modules/
 dist/
+frontend-vue/
 frontend-vue/node_modules/
 frontend-vue/dist/
 logs/queue/
