@@ -9,7 +9,6 @@ Quick runbook: see `docs/RUN_PIPELINE.md`.
 etl/        core data pipeline package
 backend/    FastAPI backend
 domain/     shared pure business rules (API/ETL/worker)
-frontend-vue/ Vue 3 app (separate deploy)
 config/     pipeline configs
 data/       inputs, lookups, boundaries
 docs/       operational runbooks
@@ -19,124 +18,47 @@ docker/     database bootstrap SQL
 ## Workflow
 ```mermaid
 flowchart TD
+R0["Load env and Spark packages"] --> R1["Run pipeline.py"]
+R1 --> R2{"OPENAI_API_KEY set?"}
+R2 -->|Yes| R3["Run llm_enrich.py"]
+R2 -->|No| R5["Run load_postgres.py optional"]
+R3 --> R4{"data/llm_corrections.csv exists?"}
+R4 -->|Yes| R6["Run retry_failed.py"]
+R4 -->|No| R5
+R6 --> R5
+R5 --> R7["Run load_elasticsearch.py optional"]
+R7 --> R8["Done"]
 
-%% -------- Orchestration --------
-subgraph RUN[run_all.sh Orchestration]
-R0[Load .env and SPARK_JARS_PACKAGES] --> R1[Start postgres optional]
-R1 --> R1B[Start elasticsearch optional]
-R1B --> R2[Run pipeline.py]
-R2 --> R3{OPENAI_API_KEY set?}
-R3 -->|Yes| R4[Run llm_enrich.py]
-R4 --> R5{data/llm_corrections.csv exists?}
-R5 -->|Yes| R6[Run retry_failed.py]
-R5 -->|No| R7[Skip retry branch]
-R3 -->|No| R7
-R6 --> R7A[Retry outputs written]
-R7A --> R8[Run load_postgres.py optional]
-R7 --> R8
-R8 --> R8B[Run load_elasticsearch.py optional]
-R8B --> R9[Done]
-end
+I1["state_codes.csv"] --> T4
+I2["district_codes.csv"] --> T4
+I3["mukim_codes.csv"] --> T4
+I4["postcodes.csv"] --> T4
+I5["district_aliases.csv optional"] --> T7
+I6["locality_lookup.csv optional"] --> T5
+I7["PBT shapefiles optional"] --> T9
 
-%% -------- Main ETL --------
-subgraph PIP[pipeline.py - Batch ETL]
-P0[Parse CLI args] --> P1[Create SparkSession + Sedona config]
-P1 --> P2{Source Type}
-P2 -->|csv| P3[extract.py read CSV]
-P2 -->|json| P4[extract.py read JSON]
-P2 -->|excel/xlsx| P5[extract.py read Excel]
-P2 -->|api| P6[extract.py read API]
-P3 --> P7[Raw DataFrame]
-P4 --> P7
-P5 --> P7
-P6 --> P7
-
-P7 --> T0[transform.py clean_addresses]
-T0 --> T1[Detect address old/new + lat/lon columns]
-T1 --> T2[Normalize missing/null style values]
-T2 --> T3[address_parse.py parse_full_address]
-T3 --> T4[Load lookup tables]
-T4 --> T5[Postcode enrichment]
-T5 --> T6[State exact + fallback]
-T6 --> T7[District fuzzy + aliases]
-T7 --> T8[Mukim fuzzy + default fallback]
-T8 --> T8A[Candidate generation Top-3 mukim candidates (state/district scoped)]
-T8A --> T9{PBT enabled and shapefiles present?}
-T9 -->|Yes| T10[Sedona spatial join ST_Intersects]
-T9 -->|No| T11[Skip PBT assignment]
-T10 --> T12[Compute confidence score]
+P0["Read raw input"] --> T0["Clean and normalize addresses"]
+T0 --> T1["Parse address fields"]
+T1 --> T4["Load lookup tables"]
+T4 --> T5["Enrich postcode and locality"]
+T5 --> T6["Match state"]
+T6 --> T7["Match district"]
+T7 --> T8["Match mukim and candidates"]
+T8 --> T9{"PBT enabled?"}
+T9 -->|Yes| T10["Spatial join for PBT"]
+T9 -->|No| T11["Skip PBT assignment"]
+T10 --> T12["Score and validate"]
 T11 --> T12
-T12 --> T13[Generate geom and geometry from lon/lat]
+T12 --> O1["Write output/cleaned parquet"]
+T12 --> O2["Write output/failed parquet"]
 
-T13 --> V0[validate_addresses]
-V0 --> V1[Build reason_codes + confidence_band + validation_status]
-V1 --> V2[Split PASS and FAIL]
-V2 --> N1[add_standard_naskod for PASS]
-V2 --> N2[add_standard_naskod for FAIL]
-N1 --> S1[Select success columns including naskod geom geometry]
-N2 --> F1[Select failed columns including naskod geom geometry]
-S1 --> O1[(output/cleaned parquet with naskod)]
-F1 --> O2[(output/failed parquet with naskod)]
-end
-
-%% -------- LLM enrichment and retry --------
-subgraph LLM[llm_enrich.py + retry_failed.py]
-L0[(output/failed parquet)] --> L1[Filter low-confidence/incomplete rows]
-L1 --> L2[Call OpenAI with JSON schema]
-L2 --> L3[Write data/llm_corrections.csv]
-L3 --> L4[retry_failed.py join failed rows + corrections]
-L4 --> L5[Re-run clean_addresses + validate_addresses]
-L5 --> L6[add_standard_naskod for retry PASS and FAIL]
-L6 --> L7[(output/cleaned-llm parquet with naskod)]
-L6 --> L8[(output/failed-llm parquet with naskod)]
-end
-
-%% -------- Postgres normalized load --------
-subgraph PG[load_postgres.py --normalized]
-G0[(output/cleaned parquet)] --> G1[Build normalized tables]
-G1 --> G2[Build nas.standardized_address rows]
-G2 --> G3[Resolve geom from geom or geometry or lat/lon]
-G3 --> G4[Write nas.standardized_address]
-G2 --> G5[Generate nas.naskod rows]
-G5 --> G6[Write nas.naskod]
-G4 --> G7[ALTER geom and boundary_geom to PostGIS geometry]
-G7 --> G8[Create GiST indexes for geometry columns]
-G6 --> G9[Create naskod constraints and unique indexes]
-end
-
-%% -------- Lookup and spatial inputs --------
-subgraph INPUTS[Lookup and Spatial Inputs]
-I1[(state_codes.csv)]
-I2[(district_codes.csv)]
-I3[(mukim_codes.csv)]
-I4[(postcodes.csv)]
-I5[(district_aliases.csv optional)]
-I6[(locality_lookup.csv optional)]
-I7[(PBT shapefiles + .prj optional)]
-end
-
-I1 --> T4
-I2 --> T4
-I3 --> T4
-I4 --> T4
-I5 --> T7
-I6 --> T5
-I7 --> T10
-
-%% -------- Audit --------
-subgraph AUDIT[audit_log.py JSONL]
-A0[(logs/nas_audit.log)]
-end
-
-PIP --> A0
-LLM --> A0
-PG --> A0
-
-%% -------- Cross-stage output flow --------
-R2 --> P0
-O2 --> L0
-O1 --> G0
-L7 -. optional manual load path .-> G0
+O2 --> L0["Optional manual correction flow"]
+L0 --> L1["Write cleaned-llm and failed-llm parquet"]
+O1 --> G0["Optional normalized Postgres load"]
+L1 --> G0
+G0 --> G1["Write nas.standardized_address and nas.naskod"]
+G1 --> A0["Write logs/nas_audit.log"]
+R1 --> A0
 ```
 
 Flow notes:
@@ -160,7 +82,6 @@ Flow notes:
 - `backend/app/services/address_read_service.py`: database read service layer for Postgres lookup endpoints.
 - `backend/app/queue/producer.py`: async queue producer abstraction + Redis Stream/SQS/log implementations.
 - `backend/app/workers/queue_consumer.py`: async worker consumer example.
-- `frontend-vue/`: standalone Vue 3 UI for separate bucket/CDN deployment.
 - `run_all.sh`: one-step script to run pipeline + load.
 - `docker-compose.yml`: PostGIS + optional Elasticsearch (`search`) + MinIO (`objectstore`) profiles.
 - `.env`: runtime config used by Docker, backend, and loaders (a template is in `.env.example`).
@@ -303,16 +224,6 @@ Run worker (required when `INGEST_EXECUTION_MODE=queue_worker`):
 python -m backend.app.workers.queue_consumer
 ```
 
-Vue frontend (separate):
-```bash
-cd frontend-vue
-npm install
-npm run dev
-```
-Open UI:
-- `http://localhost:5173/`
-- Deployment guide: `frontend-vue/README.md`
-
 Available API endpoints:
 - `GET /api/v1/health`
 - `GET /api/v1/search/autocomplete?q=jalan%20perdana&size=10`
@@ -330,8 +241,8 @@ Available API endpoints:
 - `POST /api/v1/ingest/jobs/{job_id}/pause`
 
 Upload + process flow:
-1. For smaller files, frontend sends `POST /api/v1/ingest/upload` directly to the backend.
-2. For larger files, or when a saved resumable session exists, frontend uses the multipart upload flow.
+1. For smaller files, the client sends `POST /api/v1/ingest/upload` directly to the backend.
+2. For larger files, or when a saved resumable session exists, the client uses the multipart upload flow.
 3. Multipart mode returns presigned part URLs so the browser can upload chunks directly to `nas-uploads`.
 4. Backend creates or completes the ingest job record and queues the event (`QUEUE_BACKEND=redis_stream|log|sqs`).
 5. Worker consumes the event and runs `pipeline.py` (and optional DB load).
@@ -342,14 +253,6 @@ Dockerized API + worker:
 ```bash
 docker compose up -d api worker
 ```
-
-Full Docker stack, including frontend and automatic lookup bootstrap:
-```bash
-docker compose -f docker-compose.yml -f docker-compose.frontend.yml up -d
-```
-This now waits for Postgres to become healthy, checks whether `nas_lookup.lookup_version` already exists,
-and only runs `bootstrap_lookups.py` on first-time setup. After that, `api` and `worker` start without
-rebuilding lookup tables on every restart.
 
 ## Transform + Validate Behavior
 The transform step expects a **full address string** in one column and performs:

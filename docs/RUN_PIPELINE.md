@@ -234,7 +234,7 @@ Defaults:
 - Console: `http://localhost:9001`
 - Bucket auto-created by backend: `nas-uploads`
 
-## 12) Run Backend + Vue Frontend
+## 12) Run Backend Services
 
 Start API:
 
@@ -254,28 +254,11 @@ Optional Docker services:
 docker compose up -d api worker
 ```
 
-Full Docker stack, including frontend and automatic lookup bootstrap:
-
-```bash
-docker compose -f docker-compose.yml -f docker-compose.frontend.yml up -d
-```
-
 This waits for Postgres, checks whether `nas_lookup.lookup_version` already exists, and only bootstraps the
-`nas_lookup` tables on first-time setup. Then it starts `api` and `worker`.
-
-Start Vue UI in separate terminal:
-
-```bash
-cd frontend-vue
-npm install
-npm run dev
-```
-
-Open:
-- `http://localhost:5173/`
+`nas_lookup` tables on first-time setup.
 
 Upload flow:
-- Upload CSV/JSON/Excel from UI.
+- Upload CSV/JSON/Excel from a client.
 - Backend stores it in MinIO.
 - Backend writes ingest event to queue (`QUEUE_BACKEND`).
 - Worker consumes event and runs `pipeline.py`.
