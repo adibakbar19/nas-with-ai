@@ -34,18 +34,6 @@ def _resolve_project_path(raw_path: str | Path) -> Path:
     return path
 
 
-def _config_bool(config: dict[str, object], key: str, default: bool) -> bool:
-    value = config.get(key, default)
-    if isinstance(value, bool):
-        return value
-    if isinstance(value, str):
-        normalized = value.strip().lower()
-        if normalized in {"1", "true", "yes", "y", "on"}:
-            return True
-        if normalized in {"0", "false", "no", "n", "off"}:
-            return False
-    return bool(value)
-
 
 def _load_ingest_config(config_path: str | Path = DEFAULT_INGEST_CONFIG_PATH) -> tuple[Path, dict[str, object]]:
     resolved = _resolve_project_path(config_path)
@@ -76,15 +64,15 @@ def _required_lookup_keys(config: dict[str, object]) -> tuple[str, set[str]]:
 
     required: set[str] = set()
     if lookup_source == "db":
-        required.update({"state", "district", "mukim", "locality", "sublocality", "postcode"})
+        required.update({
+            "state", "district", "mukim", "locality", "sublocality", "postcode",
+            "street_type", "street_type_alias", "street_name",
+        })
 
     if boundary_source == "db":
-        if _config_bool(config, "admin_boundary_enabled", True):
-            required.update({"state_boundary", "district_boundary", "mukim_boundary"})
-        if _config_bool(config, "postcode_boundary_enabled", True):
-            required.add(str(config.get("postcode_boundary_table", "postcode_boundary")).strip() or "postcode_boundary")
-        if _config_bool(config, "pbt_enabled", True):
-            required.add(str(config.get("pbt_boundary_table", "pbt")).strip() or "pbt")
+        required.update({"state_boundary", "district_boundary", "mukim_boundary"})
+        required.add(str(config.get("postcode_boundary_table", "postcode_boundary")).strip() or "postcode_boundary")
+        required.add(str(config.get("pbt_boundary_table", "pbt")).strip() or "pbt")
 
     return schema, required
 
@@ -138,7 +126,7 @@ def main() -> int:
     missing_summary = ", ".join(sorted(missing_keys)) if missing_keys else "lookup_version"
     print(f"Lookup bootstrap required: missing keys/table for schema {schema}: {missing_summary}.")
     print("Running bootstrap_lookups.py.")
-    from etl.bootstrap_lookups import main as bootstrap_main
+    from etl.bootstrap.bootstrap_lookups import main as bootstrap_main
 
     bootstrap_main()
     return 0

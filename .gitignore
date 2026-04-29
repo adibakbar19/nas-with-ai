@@ -9,7 +9,6 @@ venv/
 
 node_modules/
 dist/
-frontend-vue/
 frontend-vue/node_modules/
 frontend-vue/dist/
 
@@ -28,3 +27,4 @@ data/uploads/
 # Local secrets / env
 .env
 .env.*
+!.env.example

@@ -35,6 +35,7 @@ class MultipartUploadRepository:
                     """
                     CREATE TABLE IF NOT EXISTS {} (
                       session_id TEXT PRIMARY KEY,
+                      agency_id TEXT NULL,
                       status TEXT NOT NULL DEFAULT 'initiated',
                       bucket TEXT NOT NULL,
                       object_name TEXT NOT NULL,
@@ -56,6 +57,13 @@ class MultipartUploadRepository:
                     "CREATE INDEX IF NOT EXISTS {} ON {} (status, updated_at DESC)"
                 ).format(sql.Identifier("multipart_upload_status_idx"), self._tbl())
             )
+            cur.execute(sql.SQL("ALTER TABLE {} ADD COLUMN IF NOT EXISTS agency_id TEXT NULL").format(self._tbl()))
+            cur.execute(
+                sql.SQL("CREATE INDEX IF NOT EXISTS {} ON {} (agency_id, status, updated_at DESC)").format(
+                    sql.Identifier("multipart_upload_agency_status_idx"),
+                    self._tbl(),
+                )
+            )
             conn.commit()
 
     @staticmethod
@@ -70,6 +78,7 @@ class MultipartUploadRepository:
         result.update(
             {
                 "session_id": row.get("session_id"),
+                "agency_id": row.get("agency_id"),
                 "status": row.get("status"),
                 "bucket": row.get("bucket"),
                 "object_name": row.get("object_name"),
@@ -89,10 +98,11 @@ class MultipartUploadRepository:
         stmt = sql.SQL(
             """
             INSERT INTO {} (
-              session_id, status, bucket, object_name, upload_id, file_name,
+              session_id, agency_id, status, bucket, object_name, upload_id, file_name,
               content_type, content_bytes, part_size, job_id, data, created_at, updated_at
-            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb, NOW(), NOW())
+            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb, NOW(), NOW())
             ON CONFLICT (session_id) DO UPDATE SET
+              agency_id = COALESCE(EXCLUDED.agency_id, {}.agency_id),
               status = EXCLUDED.status,
               bucket = EXCLUDED.bucket,
               object_name = EXCLUDED.object_name,
@@ -105,12 +115,13 @@ class MultipartUploadRepository:
               data = EXCLUDED.data,
               updated_at = NOW()
             """
-        ).format(self._tbl())
+        ).format(self._tbl(), self._tbl())
         with self._connect() as conn, conn.cursor() as cur:
             cur.execute(
                 stmt,
                 (
                     payload["session_id"],
+                    str(payload.get("agency_id") or "").strip() or None,
                     payload.get("status", "initiated"),
                     payload["bucket"],
                     payload["object_name"],
@@ -125,19 +136,23 @@ class MultipartUploadRepository:
             )
             conn.commit()
 
-    def get_session(self, *, session_id: str) -> dict[str, Any] | None:
+    def get_session(self, *, session_id: str, agency_id: str | None = None) -> dict[str, Any] | None:
         assert sql is not None
         stmt = sql.SQL(
             """
-            SELECT session_id, status, bucket, object_name, upload_id, file_name,
+            SELECT session_id, agency_id, status, bucket, object_name, upload_id, file_name,
                    content_type, content_bytes, part_size, job_id, data
             FROM {}
             WHERE session_id = %s
-            LIMIT 1
             """
         ).format(self._tbl())
+        params: list[Any] = [session_id]
+        if agency_id:
+            stmt += sql.SQL(" AND agency_id = %s")
+            params.append(agency_id)
+        stmt += sql.SQL(" LIMIT 1")
         with self._connect() as conn, conn.cursor() as cur:
-            cur.execute(stmt, (session_id,))
+            cur.execute(stmt, tuple(params))
             row = cur.fetchone()
             return self._normalize_row(row) if row else None
 

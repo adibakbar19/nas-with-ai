@@ -47,6 +47,9 @@ class IngestJobStateRepository:
                 data = {}
         result = dict(data) if isinstance(data, dict) else {}
         result["job_id"] = str(row.get("job_id") or result.get("job_id") or "")
+        agency_id = str(row.get("agency_id") or result.get("agency_id") or "").strip()
+        if agency_id:
+            result["agency_id"] = agency_id
         if row.get("status") and not result.get("status"):
             result["status"] = row["status"]
         created_at = row.get("created_at")
@@ -69,6 +72,7 @@ class IngestJobStateRepository:
         table_ident = sql.Identifier("ingest_job")
         status_idx = sql.Identifier("ingest_job_status_idx")
         created_idx = sql.Identifier("ingest_job_created_at_idx")
+        agency_created_idx = sql.Identifier("ingest_job_agency_created_at_idx")
         with self._connect() as conn, conn.cursor() as cur:
             cur.execute(sql.SQL("CREATE SCHEMA IF NOT EXISTS {}").format(schema_ident))
             cur.execute(
@@ -76,6 +80,7 @@ class IngestJobStateRepository:
                     """
                     CREATE TABLE IF NOT EXISTS {} (
                       job_id TEXT PRIMARY KEY,
+                      agency_id TEXT NULL,
                       status TEXT NOT NULL DEFAULT 'unknown',
                       created_at TIMESTAMPTZ NULL,
                       updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
@@ -92,29 +97,47 @@ class IngestJobStateRepository:
                     "CREATE INDEX IF NOT EXISTS {} ON {} (created_at DESC NULLS LAST, updated_at DESC)"
                 ).format(created_idx, self._tbl())
             )
+            cur.execute(sql.SQL("ALTER TABLE {} ADD COLUMN IF NOT EXISTS agency_id TEXT NULL").format(self._tbl()))
+            cur.execute(
+                sql.SQL(
+                    "CREATE INDEX IF NOT EXISTS {} ON {} (agency_id, created_at DESC NULLS LAST, updated_at DESC)"
+                ).format(agency_created_idx, self._tbl())
+            )
             conn.commit()
 
-    def get_job(self, *, job_id: str) -> dict[str, Any] | None:
+    def get_job(self, *, job_id: str, agency_id: str | None = None) -> dict[str, Any] | None:
         assert sql is not None
-        stmt = sql.SQL("SELECT job_id, status, created_at, updated_at, data FROM {} WHERE job_id = %s LIMIT 1").format(
-            self._tbl()
-        )
+        stmt = sql.SQL(
+            "SELECT job_id, agency_id, status, created_at, updated_at, data FROM {} WHERE job_id = %s"
+        ).format(self._tbl())
+        params: list[Any] = [job_id]
+        if agency_id:
+            stmt += sql.SQL(" AND agency_id = %s")
+            params.append(agency_id)
+        stmt += sql.SQL(" LIMIT 1")
         with self._connect() as conn, conn.cursor() as cur:
-            cur.execute(stmt, (job_id,))
+            cur.execute(stmt, tuple(params))
             row = cur.fetchone()
             return self._normalize_data(row) if row else None
 
-    def list_jobs(self, *, limit: int | None = None) -> list[dict[str, Any]]:
+    def list_jobs(self, *, limit: int | None = None, agency_id: str | None = None) -> list[dict[str, Any]]:
         assert sql is not None
         limit_sql = sql.SQL(" LIMIT %s") if limit else sql.SQL("")
         stmt = sql.SQL(
-            "SELECT job_id, status, created_at, updated_at, data FROM {} ORDER BY created_at DESC NULLS LAST, updated_at DESC"
-        ).format(self._tbl()) + limit_sql
+            "SELECT job_id, agency_id, status, created_at, updated_at, data FROM {}"
+        ).format(self._tbl())
+        params: list[Any] = []
+        if agency_id:
+            stmt += sql.SQL(" WHERE agency_id = %s")
+            params.append(agency_id)
+        stmt += sql.SQL(" ORDER BY created_at DESC NULLS LAST, updated_at DESC")
+        stmt += limit_sql
         with self._connect() as conn, conn.cursor() as cur:
             if limit:
-                cur.execute(stmt, (limit,))
+                params.append(limit)
+                cur.execute(stmt, tuple(params))
             else:
-                cur.execute(stmt)
+                cur.execute(stmt, tuple(params))
             rows = cur.fetchall()
             return [self._normalize_data(row) for row in rows]
 
@@ -122,13 +145,15 @@ class IngestJobStateRepository:
         assert sql is not None
         payload = dict(state)
         payload["job_id"] = job_id
+        agency_id = str(payload.get("agency_id") or "").strip() or None
         status = str(payload.get("status") or "").strip() or "unknown"
         created_at = self._parse_timestamp(payload.get("created_at"))
         stmt = sql.SQL(
             """
-            INSERT INTO {} (job_id, status, created_at, updated_at, data)
-            VALUES (%s, %s, %s, NOW(), %s::jsonb)
+            INSERT INTO {} (job_id, agency_id, status, created_at, updated_at, data)
+            VALUES (%s, %s, %s, %s, NOW(), %s::jsonb)
             ON CONFLICT (job_id) DO UPDATE SET
+              agency_id = COALESCE(EXCLUDED.agency_id, {tbl}.agency_id),
               status = EXCLUDED.status,
               created_at = COALESCE({tbl}.created_at, EXCLUDED.created_at),
               updated_at = NOW(),
@@ -136,7 +161,7 @@ class IngestJobStateRepository:
             """
         ).format(self._tbl(), tbl=self._tbl())
         with self._connect() as conn, conn.cursor() as cur:
-            cur.execute(stmt, (job_id, status, created_at, json.dumps(payload, ensure_ascii=True)))
+            cur.execute(stmt, (job_id, agency_id, status, created_at, json.dumps(payload, ensure_ascii=True)))
             conn.commit()
 
     def claim_job(
@@ -150,17 +175,18 @@ class IngestJobStateRepository:
     ) -> dict[str, Any] | None:
         assert sql is not None
         select_stmt = sql.SQL(
-            "SELECT job_id, status, created_at, updated_at, data FROM {} WHERE job_id = %s FOR UPDATE"
+            "SELECT job_id, agency_id, status, created_at, updated_at, data FROM {} WHERE job_id = %s FOR UPDATE"
         ).format(self._tbl())
         update_stmt = sql.SQL(
             """
             UPDATE {}
-            SET status = %s,
+            SET agency_id = %s,
+                status = %s,
                 created_at = COALESCE(created_at, %s),
                 updated_at = NOW(),
                 data = %s::jsonb
             WHERE job_id = %s
-            RETURNING job_id, status, created_at, updated_at, data
+            RETURNING job_id, agency_id, status, created_at, updated_at, data
             """
         ).format(self._tbl())
 
@@ -196,6 +222,7 @@ class IngestJobStateRepository:
             cur.execute(
                 update_stmt,
                 (
+                    str(current.get("agency_id") or "").strip() or None,
                     "running",
                     created_at,
                     json.dumps(current, ensure_ascii=True),
@@ -210,7 +237,7 @@ class IngestJobStateRepository:
         self,
         *,
         stale_after_seconds: int,
-        statuses: tuple[str, ...] = ("running", "pausing"),
+        statuses: tuple[str, ...] = ("running",),
         limit: int = 20,
     ) -> list[dict[str, Any]]:
         assert sql is not None
@@ -220,7 +247,7 @@ class IngestJobStateRepository:
         cutoff = datetime.now(timezone.utc) - timedelta(seconds=stale_after_seconds)
         select_stmt = sql.SQL(
             """
-            SELECT job_id, status, created_at, updated_at, data
+            SELECT job_id, agency_id, status, created_at, updated_at, data
             FROM {}
             WHERE status = ANY(%s)
               AND updated_at < %s
@@ -232,11 +259,12 @@ class IngestJobStateRepository:
         update_stmt = sql.SQL(
             """
             UPDATE {}
-            SET status = %s,
+            SET agency_id = %s,
+                status = %s,
                 updated_at = NOW(),
                 data = %s::jsonb
             WHERE job_id = %s
-            RETURNING job_id, status, created_at, updated_at, data
+            RETURNING job_id, agency_id, status, created_at, updated_at, data
             """
         ).format(self._tbl())
 
@@ -253,7 +281,6 @@ class IngestJobStateRepository:
                         "job_id": current.get("job_id") or row.get("job_id"),
                         "status": "queued",
                         "progress_stage": "queued",
-                        "pause_requested": False,
                         "claimed_by": None,
                         "claimed_at": None,
                         "recovered_from_stale_claim_at": datetime.now(timezone.utc).isoformat(),
@@ -266,6 +293,7 @@ class IngestJobStateRepository:
                 cur.execute(
                     update_stmt,
                     (
+                        str(current.get("agency_id") or "").strip() or None,
                         "queued",
                         json.dumps(current, ensure_ascii=True),
                         str(row["job_id"]),

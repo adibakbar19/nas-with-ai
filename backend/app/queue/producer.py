@@ -1,9 +1,8 @@
-import json
 import logging
-from pathlib import Path
 from typing import Protocol
 
-from backend.app.schemas.ingest import BulkIngestEvent
+from backend.app.monitoring import record_queue_publish
+from backend.app.schemas.ingest import BulkIngestEvent, SearchSyncEvent
 
 
 logger = logging.getLogger(__name__)
@@ -13,69 +12,54 @@ class QueueProducer(Protocol):
     def publish_bulk_ingest(self, event: BulkIngestEvent) -> str:
         ...
 
-
-class LoggingQueueProducer:
-    """File-backed local queue producer for development and simple deployments."""
-
-    def __init__(self, *, event_log_path: str) -> None:
-        self._event_log_path = Path(event_log_path)
-
-    def publish_bulk_ingest(self, event: BulkIngestEvent) -> str:
-        self._event_log_path.parent.mkdir(parents=True, exist_ok=True)
-        with self._event_log_path.open("a", encoding="utf-8") as handle:
-            handle.write(event.model_dump_json())
-            handle.write("\n")
-        logger.info("queue_publish backend=log event_id=%s job_id=%s", event.event_id, event.job_id)
-        return event.event_id
+    def publish_search_sync(self, event: SearchSyncEvent) -> str:
+        ...
 
 
-class SQSQueueProducer:
-    def __init__(self, *, queue_url: str, region: str) -> None:
-        if not queue_url:
-            raise ValueError("SQS queue_url must be configured")
-        try:
-            import boto3
-        except Exception as exc:  # pragma: no cover - optional dependency
-            raise RuntimeError("boto3 is required for SQSQueueProducer") from exc
-        self._client = boto3.client("sqs", region_name=region)
-        self._queue_url = queue_url
+class ValkeyStreamQueueProducer:
+    """Valkey Stream producer for bulk ingest jobs."""
 
-    def publish_bulk_ingest(self, event: BulkIngestEvent) -> str:
-        body = event.model_dump()
-        kwargs = {
-            "QueueUrl": self._queue_url,
-            "MessageBody": json.dumps(body, ensure_ascii=True),
-        }
-        if self._queue_url.endswith(".fifo"):
-            kwargs["MessageDeduplicationId"] = event.event_id
-            kwargs["MessageGroupId"] = "nas-bulk-ingest"
-        response = self._client.send_message(**kwargs)
-        return str(response.get("MessageId") or event.event_id)
-
-
-class RedisStreamQueueProducer:
-    def __init__(self, *, redis_url: str, stream_key: str) -> None:
-        if not redis_url:
-            raise ValueError("Redis stream redis_url must be configured")
+    def __init__(self, *, valkey_url: str, stream_key: str) -> None:
+        if not valkey_url:
+            raise ValueError("VALKEY_URL must be configured")
         if not stream_key:
-            raise ValueError("Redis stream stream_key must be configured")
+            raise ValueError("VALKEY_STREAM_KEY must be configured")
         try:
             import redis
         except Exception as exc:  # pragma: no cover - optional dependency
-            raise RuntimeError("redis is required for RedisStreamQueueProducer") from exc
-        self._client = redis.Redis.from_url(redis_url, decode_responses=True)
+            raise RuntimeError("redis package is required for Valkey Streams") from exc
+        self._client = redis.Redis.from_url(valkey_url, decode_responses=True)
         self._stream_key = stream_key
+
+    def _publish_event(self, *, event_type: str, event_id: str, payload: str, job_id: str) -> str:
+        message_id = self._client.xadd(
+            self._stream_key,
+            {"event_type": event_type, "event_id": event_id, "payload": payload},
+        )
+        record_queue_publish("valkey_stream")
+        logger.info(
+            "queue_publish backend=valkey_stream event_type=%s message_id=%s event_id=%s job_id=%s",
+            event_type,
+            message_id,
+            event_id,
+            job_id,
+        )
+        return str(message_id)
 
     def publish_bulk_ingest(self, event: BulkIngestEvent) -> str:
         payload = event.model_dump_json()
-        message_id = self._client.xadd(
-            self._stream_key,
-            {"event_type": event.event_type, "event_id": event.event_id, "payload": payload},
+        return self._publish_event(
+            event_type=event.event_type,
+            event_id=event.event_id,
+            payload=payload,
+            job_id=event.job_id,
         )
-        logger.info(
-            "queue_publish backend=redis_stream message_id=%s event_id=%s job_id=%s",
-            message_id,
-            event.event_id,
-            event.job_id,
+
+    def publish_search_sync(self, event: SearchSyncEvent) -> str:
+        payload = event.model_dump_json()
+        return self._publish_event(
+            event_type=event.event_type,
+            event_id=event.event_id,
+            payload=payload,
+            job_id=event.job_id,
         )
-        return str(message_id)
