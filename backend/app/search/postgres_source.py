@@ -227,7 +227,12 @@ def _build_postgres_select(*, schema: str, inspector) -> str:
 def iter_search_documents(*, db_url: str, schema: str, batch_size: int) -> Iterator[dict[str, Any]]:
     engine = sa.create_engine(sqlalchemy_postgres_url(db_url))
     inspector = sa.inspect(engine)
-    query = _build_postgres_select(schema=schema, inspector=inspector)
+    try:
+        query = _build_postgres_select(schema=schema, inspector=inspector)
+    except RuntimeError as exc:
+        if "Missing table" in str(exc):
+            return
+        raise
     with engine.connect().execution_options(stream_results=True) as conn:
         result = conn.execute(sa.text(query))
         while True:
