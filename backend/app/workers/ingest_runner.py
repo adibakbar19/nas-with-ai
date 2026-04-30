@@ -40,12 +40,10 @@ def _run_post_success_processing(
         "etl.load.postgres",
         "--input",
         str(success_path),
-        "--table",
-        "standardized_address",
     ]
     if warning_path is not None:
         load_cmd.append(str(warning_path))
-    load_cmd.extend(["--mode", "append"])
+    load_cmd.extend(["--table", "standardized_address", "--mode", "append"])
     load_emit = 0.0
     load_persist = 0.0
     with log_path.open("a", encoding="utf-8") as logfile:
