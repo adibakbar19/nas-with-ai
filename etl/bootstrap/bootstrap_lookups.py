@@ -112,12 +112,24 @@ def _load_state_boundary(engine: sa.Engine, schema: str) -> None:
 
 def _load_district_boundary(engine: sa.Engine, schema: str) -> None:
     print("Loading district boundary...")
+    # DIVISION_C in the GeoJSON is unreliable (all zeros) — derive district_code
+    # from the district lookup CSV by joining on (state_code, district_name).
     gdf = _load_boundary(
         BOUNDARY_DIR / "district_boundary.geojson",
-        {"STATE_CODE": "state_code", "DISTRICT": "district_name", "DIVISION_C": "district_code"},
+        {"STATE_CODE": "state_code", "DISTRICT": "district_name"},
     )
     gdf["district_name"] = gdf["district_name"].str.strip().str.upper()
-    gdf["district_code"] = gdf["district_code"].str.strip().str.zfill(2)
+    gdf["state_code"] = gdf["state_code"].str.strip()
+
+    lookup = pd.read_csv(LOOKUPS_DIR / "district.csv", dtype=str)[["state_code", "district_name", "district_code"]]
+    lookup["district_name"] = lookup["district_name"].str.strip().str.upper()
+    lookup["state_code"] = lookup["state_code"].str.strip()
+
+    gdf = gdf.merge(lookup, on=["state_code", "district_name"], how="left")
+    unmatched = gdf["district_code"].isna().sum()
+    if unmatched:
+        print(f"  WARNING: {unmatched} district polygons could not be matched to a district_code")
+
     gdf = gdf.rename_geometry("boundary_geom")
     gdf.to_postgis("district_boundary", engine, schema=schema, if_exists="replace", index=False)
     print(f"  {len(gdf)} district polygons — done")
