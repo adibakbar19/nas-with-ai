@@ -657,6 +657,116 @@ button.slim {
 }
 .stage-section.stage-failed .stage-dot { background: var(--fail); }
 
+/* ── Login screen ──────────────────────────────────────── */
+.login-page {
+  min-height: 100vh;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+}
+
+.login-card {
+  width: 100%;
+  max-width: 400px;
+  padding: 40px 36px;
+  background: var(--panel-strong);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-lg);
+  box-shadow: var(--shadow);
+}
+
+.login-brand {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font-weight: 700;
+  font-size: 1.05rem;
+  letter-spacing: -0.02em;
+  margin-bottom: 28px;
+}
+
+.login-title {
+  margin: 0 0 24px;
+  font-size: 1.5rem;
+  font-weight: 700;
+  letter-spacing: -0.04em;
+}
+
+.login-form {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+.login-field {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.login-field label {
+  font-size: 0.85rem;
+  font-weight: 600;
+  color: var(--muted);
+}
+
+.login-field input {
+  min-height: 48px;
+  padding: 0 16px;
+  border: 1px solid var(--line-strong);
+  border-radius: var(--radius-sm);
+  background: var(--bg);
+  color: var(--ink);
+  transition: border-color 160ms ease, box-shadow 160ms ease;
+}
+
+.login-field input:focus {
+  outline: none;
+  border-color: rgba(12, 124, 89, 0.4);
+  box-shadow: 0 0 0 4px rgba(12, 124, 89, 0.1);
+}
+
+.login-field input:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+.login-error {
+  margin: 0;
+  padding: 10px 14px;
+  border-radius: var(--radius-sm);
+  background: var(--fail-soft);
+  color: var(--fail);
+  font-size: 0.85rem;
+}
+
+.login-btn {
+  width: 100%;
+  min-height: 48px;
+  margin-top: 4px;
+  font-size: 1rem;
+}
+
+.login-btn:disabled {
+  opacity: 0.7;
+  cursor: not-allowed;
+  transform: none;
+}
+
+/* ── Topbar right section ───────────────────────────────── */
+.topbar-right {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+}
+
+.topbar-user {
+  font-size: 0.85rem;
+  font-weight: 600;
+  color: var(--muted);
+}
+
 /* ── Mono ──────────────────────────────────────────────── */
 .mono {
   font-family: 'IBM Plex Mono', monospace;

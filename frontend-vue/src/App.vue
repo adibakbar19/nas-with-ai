@@ -4,6 +4,8 @@ import { computed, onMounted, onUnmounted, ref } from 'vue'
 const AUTO_REFRESH_MS = 2000
 const API_BASE_URL = (import.meta.env.VITE_API_BASE_URL || '').replace(/\/$/, '')
 const MULTIPART_SESSION_PREFIX = 'nas.multipart.upload'
+const TOKEN_STORAGE_KEY = 'nas.token'
+const USERNAME_STORAGE_KEY = 'nas.username'
 const multipartThresholdRaw = Number(import.meta.env.VITE_MULTIPART_THRESHOLD_BYTES || 32 * 1024 * 1024)
 const MULTIPART_THRESHOLD_BYTES = Number.isFinite(multipartThresholdRaw)
   ? Math.max(1, multipartThresholdRaw)
@@ -14,6 +16,13 @@ const PIPELINE_STAGE_ORDER = [
   { id: 'validate', label: 'Validate' },
   { id: 'final', label: 'Finalize' },
 ]
+
+const token = ref(localStorage.getItem(TOKEN_STORAGE_KEY) || '')
+const loggedInUsername = ref(localStorage.getItem(USERNAME_STORAGE_KEY) || '')
+const loginUsername = ref('')
+const loginPassword = ref('')
+const loginError = ref('')
+const loginLoading = ref(false)
 
 const activeNav = ref('uploads')
 const isDragging = ref(0)
@@ -29,8 +38,58 @@ const lastUpdatedLabel = ref('Waiting for first sync')
 
 let refreshTimer = null
 
+function clearSession() {
+  token.value = ''
+  loggedInUsername.value = ''
+  localStorage.removeItem(TOKEN_STORAGE_KEY)
+  localStorage.removeItem(USERNAME_STORAGE_KEY)
+}
+
+async function login() {
+  loginError.value = ''
+  loginLoading.value = true
+  try {
+    const res = await fetch(`${API_BASE_URL}/api/v1/auth/login`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username: loginUsername.value, password: loginPassword.value }),
+    })
+    if (!res.ok) {
+      const body = await res.json().catch(() => ({}))
+      loginError.value = body.detail || `Login failed (${res.status})`
+      return
+    }
+    const data = await res.json()
+    token.value = data.access_token
+    loggedInUsername.value = data.username || loginUsername.value
+    localStorage.setItem(TOKEN_STORAGE_KEY, token.value)
+    localStorage.setItem(USERNAME_STORAGE_KEY, loggedInUsername.value)
+    loginUsername.value = ''
+    loginPassword.value = ''
+    await refreshDashboard()
+  } catch (err) {
+    loginError.value = err.message || 'Network error'
+  } finally {
+    loginLoading.value = false
+  }
+}
+
+function logout() {
+  clearSession()
+  if (refreshTimer) {
+    clearInterval(refreshTimer)
+    refreshTimer = null
+  }
+}
+
 async function apiFetch(path, init = {}) {
-  const res = await fetch(`${API_BASE_URL}${path}`, init)
+  const headers = { ...(init.headers || {}) }
+  if (token.value) headers['Authorization'] = `Bearer ${token.value}`
+  const res = await fetch(`${API_BASE_URL}${path}`, { ...init, headers })
+  if (res.status === 401) {
+    clearSession()
+    throw new Error('Session expired — please log in again')
+  }
   if (!res.ok) {
     const body = await res.text()
     throw new Error(body || `${res.status} ${res.statusText}`)
@@ -431,7 +490,52 @@ onUnmounted(() => {
 </script>
 
 <template>
-  <div class="app-shell">
+  <!-- ── Login screen ──────────────────────────────────── -->
+  <div v-if="!token" class="login-page">
+    <div class="login-card">
+      <div class="login-brand">
+        <svg width="28" height="28" viewBox="0 0 22 22" fill="none" aria-hidden="true">
+          <rect x="2" y="2" width="8" height="8" rx="2" fill="var(--brand)"/>
+          <rect x="12" y="2" width="8" height="8" rx="2" fill="var(--brand)" opacity="0.55"/>
+          <rect x="2" y="12" width="8" height="8" rx="2" fill="var(--brand)" opacity="0.55"/>
+          <rect x="12" y="12" width="8" height="8" rx="2" fill="var(--brand)" opacity="0.3"/>
+        </svg>
+        <span>NAS Portal</span>
+      </div>
+      <h1 class="login-title">Sign in</h1>
+      <form class="login-form" @submit.prevent="login">
+        <div class="login-field">
+          <label for="login-username">Username</label>
+          <input
+            id="login-username"
+            v-model="loginUsername"
+            type="text"
+            autocomplete="username"
+            required
+            :disabled="loginLoading"
+          />
+        </div>
+        <div class="login-field">
+          <label for="login-password">Password</label>
+          <input
+            id="login-password"
+            v-model="loginPassword"
+            type="password"
+            autocomplete="current-password"
+            required
+            :disabled="loginLoading"
+          />
+        </div>
+        <p v-if="loginError" class="login-error">{{ loginError }}</p>
+        <button type="submit" :disabled="loginLoading" class="login-btn">
+          {{ loginLoading ? 'Signing in…' : 'Sign in' }}
+        </button>
+      </form>
+    </div>
+  </div>
+
+  <!-- ── Main app ──────────────────────────────────────── -->
+  <div v-else class="app-shell">
 
     <!-- Top bar -->
     <header class="topbar">
@@ -444,7 +548,11 @@ onUnmounted(() => {
         </svg>
         NAS Portal
       </div>
-      <div class="topbar-sync">Synced {{ lastUpdatedLabel }}</div>
+      <div class="topbar-right">
+        <span class="topbar-sync">Synced {{ lastUpdatedLabel }}</span>
+        <span class="topbar-user">{{ loggedInUsername }}</span>
+        <button class="secondary slim" type="button" @click="logout">Sign out</button>
+      </div>
     </header>
 
     <!-- Workspace: sidebar + content -->
@@ -734,4 +842,5 @@ onUnmounted(() => {
       </main>
     </div>
   </div>
+  <!-- end v-else (main app) -->
 </template>
