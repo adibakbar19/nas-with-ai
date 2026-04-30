@@ -38,8 +38,40 @@ def _qualified_table(schema: str, table_name: str) -> str:
     return f"{_quote_ident(schema)}.{_quote_ident(table_name)}"
 
 
+def _table_exists(schema: str, table_name: str) -> bool:
+    bind = op.get_bind()
+    row = bind.exec_driver_sql(
+        """
+        SELECT EXISTS (
+          SELECT 1
+          FROM information_schema.tables
+          WHERE table_schema = %s
+            AND table_name = %s
+        )
+        """,
+        (schema, table_name),
+    ).scalar()
+    return bool(row)
+
+
+def _schema_exists(schema: str) -> bool:
+    bind = op.get_bind()
+    return bool(
+        bind.exec_driver_sql(
+            "SELECT EXISTS (SELECT 1 FROM information_schema.schemata WHERE schema_name = %s)",
+            (schema,),
+        ).scalar()
+    )
+
+
 def upgrade() -> None:
     schema = _lookup_schema()
+
+    # nas_lookup is created and populated by db-bootstrap which runs after db-migrate.
+    # On a fresh DB this schema does not exist yet, so skip — bootstrap handles it.
+    if not _schema_exists(schema):
+        return
+
     state = _qualified_table(schema, "state")
     district = _qualified_table(schema, "district")
     mukim = _qualified_table(schema, "mukim")
@@ -55,6 +87,19 @@ def upgrade() -> None:
     op.execute(f"ALTER TABLE IF EXISTS {mukim_boundary} ADD COLUMN IF NOT EXISTS state_id INTEGER NULL")
     op.execute(f"ALTER TABLE IF EXISTS {mukim_boundary} ADD COLUMN IF NOT EXISTS district_id INTEGER NULL")
     op.execute(f"ALTER TABLE IF EXISTS {postcode_boundary} ADD COLUMN IF NOT EXISTS postcode_id INTEGER NULL")
+
+    required_tables = (
+        "state",
+        "district",
+        "mukim",
+        "postcode",
+        "state_boundary",
+        "district_boundary",
+        "mukim_boundary",
+        "postcode_boundary",
+    )
+    if not all(_table_exists(schema, table_name) for table_name in required_tables):
+        return
 
     op.execute(
         f"""

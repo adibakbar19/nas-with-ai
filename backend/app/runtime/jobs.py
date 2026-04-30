@@ -4,7 +4,6 @@ import traceback
 from typing import Any
 
 from backend.app.core.settings import get_settings
-from backend.app.dependencies import get_queue_producer
 from backend.app.runtime import job_state
 from backend.app.runtime import settings
 from backend.app.schemas.ingest import BulkIngestEvent, SearchSyncEvent
@@ -120,6 +119,7 @@ def queue_ingest_job(job_id: str) -> None:
         resume_from_checkpoint=bool(job.get("resume_from_checkpoint", True)),
         resume_failed_only=bool(job.get("resume_failed_only", True)),
     )
+    from backend.app.dependencies import get_queue_producer
     get_queue_producer().publish_bulk_ingest(event)
 
 
@@ -130,6 +130,7 @@ def queue_search_sync_job(job_id: str, *, recreate_index: bool = False) -> None:
         es_index=settings.ES_INDEX,
         recreate_index=recreate_index,
     )
+    from backend.app.dependencies import get_queue_producer
     get_queue_producer().publish_search_sync(event)
     set_job(
         job_id,

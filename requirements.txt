@@ -12,6 +12,7 @@ python-multipart
 psycopg[binary]
 sqlalchemy
 alembic
+geoalchemy2
 prometheus-client
 boto3
 redis

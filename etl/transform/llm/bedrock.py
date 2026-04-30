@@ -33,7 +33,13 @@ class BedrockClaudeAddressMapper:
         self.batch_size = int(batch_size or os.getenv("BEDROCK_ADDRESS_BATCH_SIZE", "25"))
         self._client = boto3.client(
             "bedrock-runtime",
-            region_name=region_name or os.getenv("AWS_REGION") or os.getenv("AWS_DEFAULT_REGION"),
+            region_name=(
+                region_name
+                or os.getenv("BEDROCK_AWS_REGION")
+                or os.getenv("BEDROCK_REGION")
+                or os.getenv("AWS_REGION")
+                or os.getenv("AWS_DEFAULT_REGION")
+            ),
         )
 
     @staticmethod
