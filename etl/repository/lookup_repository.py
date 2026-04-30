@@ -68,7 +68,14 @@ def load_lookup_frames(*, config: dict) -> LookupFrames:
                 dtype=str,
             ),
             mukim=pd.read_sql(
-                f"SELECT state_code, state_name, district_code, district_name, mukim_code, mukim_name, mukim_id FROM {schema}.mukim",
+                f"""
+                SELECT m.state_code, st.state_name, m.district_code, d.district_name,
+                       m.mukim_code, m.mukim_name, m.mukim_id
+                FROM {schema}.mukim m
+                LEFT JOIN {schema}.state st ON st.state_code = m.state_code
+                LEFT JOIN {schema}.district d ON d.district_code = m.district_code
+                  AND d.state_code = m.state_code
+                """,
                 conn,
                 dtype=str,
             ),
