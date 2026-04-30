@@ -28,3 +28,4 @@ data/uploads/
 .env
 .env.*
 !.env.example
+venv/
