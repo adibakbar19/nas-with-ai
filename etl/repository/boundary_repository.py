@@ -75,7 +75,7 @@ def load_admin_boundaries(config: dict):
         _read_boundary_table(
             config,
             _table(config, "mukim_boundary_table", "mukim_boundary"),
-            ["state_code", "district_code", "district_name", "mukim_code", "mukim_name", "mukim_id"],
+            ["state_code", "district_name", "mukim_code", "mukim_name", "mukim_id"],
         ),
     )
 
