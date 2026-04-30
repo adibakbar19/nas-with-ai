@@ -32,12 +32,17 @@ def _spatial_join_first(df: DataFrame, boundaries, columns: dict[str, str]) -> p
         geometry=[Point(lon, lat) for lon, lat in zip(df.loc[valid, "longitude"], df.loc[valid, "latitude"])],
         crs="EPSG:4326",
     )
-    right_cols = list(columns.values()) + ["geometry"]
-    joined = gpd.sjoin(points, boundaries[right_cols], how="left", predicate="within")
+    # Rename boundary columns to target names before sjoin to avoid conflicts
+    # with same-named columns in the address data (e.g. "postcode", "state").
+    rename_map = {source: target for target, source in columns.items()}
+    geom_col = boundaries.geometry.name
+    right = boundaries[[*columns.values(), geom_col]].rename(columns=rename_map)
+    joined = gpd.sjoin(points, right, how="left", predicate="within")
     joined = joined[~joined.index.duplicated(keep="first")]
     out = pd.DataFrame(index=df.index)
-    for target, source in columns.items():
-        out.loc[joined.index, target] = joined[source]
+    for target in columns:
+        if target in joined.columns:
+            out.loc[joined.index, target] = joined[target]
     return out
 
 
