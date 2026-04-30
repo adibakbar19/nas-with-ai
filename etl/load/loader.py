@@ -20,6 +20,12 @@ def _prepare_output_path(path: str, mode: str) -> None:
 
 def load_parquet(df: DataFrame, output_path: str, *, mode: str = "overwrite") -> None:
     _prepare_output_path(output_path, mode)
+    # Coerce mixed-type object columns to string to prevent PyArrow serialization errors.
+    # Excel files commonly produce columns like "6C" alongside plain integers.
+    df = df.copy()
+    for col in df.select_dtypes(include="object").columns:
+        if len({type(v).__name__ for v in df[col].dropna()}) > 1:
+            df[col] = df[col].astype(str)
     df.to_parquet(output_path, index=False)
 
 
