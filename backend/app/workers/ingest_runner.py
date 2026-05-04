@@ -34,6 +34,7 @@ def _run_post_success_processing(
         load_status="running",
         last_log_line="Starting Postgres load",
     )
+    schema = runtime_settings.INGEST_JOB_STATE_SCHEMA
     load_cmd = [
         sys.executable,
         "-m",
@@ -43,7 +44,7 @@ def _run_post_success_processing(
     ]
     if warning_path is not None:
         load_cmd.append(str(warning_path))
-    load_cmd.extend(["--table", "standardized_address", "--mode", "append"])
+    load_cmd.extend(["--table", "standardized_address", "--schema", schema, "--mode", "append"])
     load_emit = 0.0
     load_persist = 0.0
     with log_path.open("a", encoding="utf-8") as logfile:
