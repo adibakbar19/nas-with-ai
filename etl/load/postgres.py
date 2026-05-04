@@ -28,11 +28,14 @@ def _read_inputs(paths: Iterable[str]) -> pd.DataFrame:
 
 
 def _clean_for_sql(df: pd.DataFrame) -> pd.DataFrame:
+    import numpy as np
     out = df.copy()
     for col_name in out.columns:
-        if out[col_name].map(lambda value: isinstance(value, (list, dict))).any():
+        if out[col_name].map(lambda value: isinstance(value, (list, dict, np.ndarray))).any():
             out[col_name] = out[col_name].map(
-                lambda value: str(value) if isinstance(value, (list, dict)) else (None if pd.isna(value) else value)
+                lambda value: str(list(value)) if isinstance(value, np.ndarray) else (
+                    str(value) if isinstance(value, (list, dict)) else (None if pd.isna(value) else value)
+                )
             )
     return out.where(pd.notna(out), None)
 
