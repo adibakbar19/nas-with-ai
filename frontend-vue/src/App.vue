@@ -43,6 +43,10 @@ function clearSession() {
   loggedInUsername.value = ''
   localStorage.removeItem(TOKEN_STORAGE_KEY)
   localStorage.removeItem(USERNAME_STORAGE_KEY)
+  if (refreshTimer) {
+    clearInterval(refreshTimer)
+    refreshTimer = null
+  }
 }
 
 async function login() {
@@ -263,6 +267,7 @@ async function loadRuns() {
 }
 
 async function refreshDashboard() {
+  if (!token.value) return
   if (dashboardRefreshInFlight.value) return
   dashboardRefreshInFlight.value = true
   try {
