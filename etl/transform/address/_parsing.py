@@ -51,6 +51,9 @@ def _standardize_common_columns(df: DataFrame, config: dict) -> DataFrame:
         detected = _detect_col(out, overrides.get(canonical, defaults))
         if detected and detected != canonical:
             out = out.rename(columns={detected: canonical})
+    for code_col in ("state_code", "district_code", "mukim_code"):
+        if code_col in out.columns:
+            out[code_col] = out[code_col].astype("string").where(out[code_col].notna(), pd.NA)
     return out
 
 
