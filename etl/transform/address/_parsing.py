@@ -29,8 +29,11 @@ def _standardize_common_columns(df: DataFrame, config: dict) -> DataFrame:
     out = df.copy()
     alias_defaults = {
         "state_name": ["state", "negeri", "nama_negeri", "nm_negeri"],
+        "state_code": ["kod_negeri", "negeri_kod", "state_kod"],
         "district_name": ["district", "daerah", "nama_daerah", "nm_daerah"],
+        "district_code": ["kod_daerah", "daerah_kod", "district_kod"],
         "mukim_name": ["mukim", "nama_mukim", "nm_mukim"],
+        "mukim_code": ["kod_mukim", "mukim_kod"],
         "locality_name": ["locality", "city", "town", "bandar", "pekan", "nama_bandar"],
         "postcode": ["postcode", "poskod", "postal_code", "zip", "zip_code"],
         "premise_no": ["house_no", "house_number", "no_rumah", "nombor_rumah", "building_no"],
