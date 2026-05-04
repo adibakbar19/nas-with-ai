@@ -451,8 +451,10 @@ async function downloadFailedRows(jobId) {
     const a = document.createElement('a')
     a.href = url
     a.download = `failed_rows_${jobId}.csv`
+    document.body.appendChild(a)
     a.click()
-    URL.revokeObjectURL(url)
+    document.body.removeChild(a)
+    setTimeout(() => URL.revokeObjectURL(url), 1000)
   } catch (error) {
     uploadMeta.value = `Download failed: ${error.message}`
   }
