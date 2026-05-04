@@ -1,6 +1,9 @@
+from pathlib import Path
 from typing import Any
 
+import pandas as pd
 from fastapi import APIRouter, Depends, File, Form, Header, HTTPException, Query, UploadFile
+from fastapi.responses import Response
 
 from backend.app.dependencies import get_ingest_service
 from backend.app.schemas.ingest import (
@@ -125,6 +128,32 @@ def get_ingest_job(
         return ingest_service.get_job(job_id, agency_id=agency.agency_id)
     except ServiceError as exc:
         raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
+
+
+@router.get("/api/v1/ingest/jobs/{job_id}/failed-rows.csv")
+def download_failed_rows(
+    job_id: str,
+    agency: Agency = Depends(get_current_agency),
+    ingest_service: IngestService = Depends(get_ingest_service),
+) -> Response:
+    require_permission(agency, "ingest.read")
+    try:
+        job = ingest_service.get_job(job_id, agency_id=agency.agency_id)
+    except ServiceError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
+
+    failed_path = (job or {}).get("failed_path")
+    if not failed_path or not Path(failed_path).exists():
+        raise HTTPException(status_code=404, detail="No failed rows available for this job")
+
+    df = pd.read_parquet(failed_path)
+    keep_cols = [c for c in df.columns if not c.startswith("_")]
+    csv_content = df[keep_cols].to_csv(index=False)
+    return Response(
+        content=csv_content,
+        media_type="text/csv",
+        headers={"Content-Disposition": f'attachment; filename="failed_rows_{job_id}.csv"'},
+    )
 
 
 @router.post(

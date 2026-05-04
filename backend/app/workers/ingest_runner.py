@@ -13,7 +13,7 @@ from typing import Any
 from backend.app.object_store import build_s3_client
 from backend.app.runtime import jobs as ingest_jobs
 from backend.app.runtime import settings as runtime_settings
-from backend.app.runtime.logs import extract_error_summary, progress_from_log_line, sanitize_log_line
+from backend.app.runtime.logs import extract_error_summary, parse_counts_from_log, progress_from_log_line, sanitize_log_line
 
 
 def _run_post_success_processing(
@@ -218,6 +218,8 @@ def _run_retry_failed_rows_job(job_id: str, job: dict[str, Any]) -> None:
             code = proc.wait()
             logfile.write(f"[{ingest_jobs.now_iso()}] end retry job={job_id} exit_code={code}\n")
 
+        counts = parse_counts_from_log(log_path)
+
         if code == 0:
             if not _run_post_success_processing(
                 job_id=job_id,
@@ -239,6 +241,7 @@ def _run_retry_failed_rows_job(job_id: str, job: dict[str, Any]) -> None:
                 progress_pct=100,
                 progress_stage="completed",
                 load_status="completed",
+                **counts,
             )
             return
 
@@ -254,6 +257,7 @@ def _run_retry_failed_rows_job(job_id: str, job: dict[str, Any]) -> None:
             progress_pct=100,
             progress_stage="failed",
             load_status="failed",
+            **counts,
         )
     except Exception as exc:
         ingest_jobs.set_job(
@@ -389,6 +393,8 @@ def run_ingest_job(job_id: str) -> None:
             code = proc.wait()
             logfile.write(f"[{ingest_jobs.now_iso()}] end job={job_id} exit_code={code}\n")
 
+        counts = parse_counts_from_log(log_path)
+
         if code == 0:
             if not _run_post_success_processing(
                 job_id=job_id,
@@ -411,6 +417,7 @@ def run_ingest_job(job_id: str) -> None:
                 progress_pct=100,
                 progress_stage="completed",
                 load_status="completed",
+                **counts,
             )
             return
 
@@ -426,6 +433,7 @@ def run_ingest_job(job_id: str) -> None:
             progress_pct=100,
             progress_stage="failed",
             load_status="failed",
+            **counts,
         )
     except Exception as exc:
         ingest_jobs.set_job(

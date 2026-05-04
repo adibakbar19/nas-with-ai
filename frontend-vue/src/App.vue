@@ -443,6 +443,21 @@ async function uploadFileInParts(file, initialSession = null) {
   return payload
 }
 
+async function downloadFailedRows(jobId) {
+  try {
+    const res = await apiFetch(`/api/v1/ingest/jobs/${encodeURIComponent(jobId)}/failed-rows.csv`)
+    const blob = await res.blob()
+    const url = URL.createObjectURL(blob)
+    const a = document.createElement('a')
+    a.href = url
+    a.download = `failed_rows_${jobId}.csv`
+    a.click()
+    URL.revokeObjectURL(url)
+  } catch (error) {
+    uploadMeta.value = `Download failed: ${error.message}`
+  }
+}
+
 async function pauseJob(jobId) {
   uploadMeta.value = `Pausing job...`
   try {
@@ -812,6 +827,11 @@ onUnmounted(() => {
                 <div class="progress-track slim-track">
                   <div class="progress-fill" :style="{ width: run.progressPct }"></div>
                 </div>
+                <div v-if="run.success_count != null || run.failed_count != null" class="row-counts">
+                  <span v-if="run.success_count != null" class="count-ok">{{ run.success_count }} loaded</span>
+                  <span v-if="run.warning_count" class="count-warn">{{ run.warning_count }} warnings</span>
+                  <span v-if="run.failed_count" class="count-fail">{{ run.failed_count }} failed</span>
+                </div>
               </div>
 
               <div class="history-card-right">
@@ -832,6 +852,14 @@ onUnmounted(() => {
                     @click="resumeJob(run.job_id, String(run.status || '').toLowerCase() === 'uploaded')"
                   >
                     {{ String(run.status || '').toLowerCase() === 'uploaded' ? 'Start' : 'Resume' }}
+                  </button>
+                  <button
+                    v-if="run.failed_count > 0"
+                    class="secondary slim"
+                    type="button"
+                    @click="downloadFailedRows(run.job_id)"
+                  >
+                    Download failed
                   </button>
                 </div>
               </div>

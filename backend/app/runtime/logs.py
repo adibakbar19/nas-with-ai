@@ -88,3 +88,22 @@ def progress_from_log_line(line: str, current_pct: int, current_stage: str) -> t
         return pct, current_stage
 
     return current_pct, current_stage
+
+
+def parse_counts_from_log(log_path: Path) -> dict:
+    """Extract success/warning/failed counts from the CHECKPOINT stage=load line."""
+    if not log_path.exists():
+        return {}
+    try:
+        text = log_path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return {}
+    for line in reversed(text.splitlines()):
+        if "CHECKPOINT" in line and "stage=load" in line and "event=done" in line:
+            counts = {}
+            for key in ("success_count", "warning_count", "failed_count"):
+                m = re.search(rf"{key}=(\d+)", line)
+                if m:
+                    counts[key] = int(m.group(1))
+            return counts
+    return {}

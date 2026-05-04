@@ -256,6 +256,9 @@ class IngestJobResponse(BaseModel):
     error: str | None = None
     parent_job_id: str | None = None
     require_mukim: bool | None = None
+    success_count: int | None = None
+    warning_count: int | None = None
+    failed_count: int | None = None
 
     model_config = {
         "extra": "allow",
