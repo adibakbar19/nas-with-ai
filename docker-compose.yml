@@ -97,6 +97,9 @@ services:
     command: uvicorn backend.app.main:app --host 0.0.0.0 --port 8000
     ports:
       - "8000:8000"
+    volumes:
+      - nas_output:/app/output
+      - nas_logs:/app/logs
     depends_on:
       db-bootstrap:
         condition: service_completed_successfully
@@ -126,6 +129,9 @@ services:
       - INGEST_EXECUTION_MODE=queue_worker
       - WORKER_METRICS_PORT=9101
     command: python -m backend.app.workers.queue_consumer
+    volumes:
+      - nas_output:/app/output
+      - nas_logs:/app/logs
     depends_on:
       db-bootstrap:
         condition: service_completed_successfully
@@ -150,3 +156,5 @@ services:
 volumes:
   postgres_data:
   opensearch_data:
+  nas_output:
+  nas_logs:
