@@ -258,7 +258,7 @@ async function loadIngestJobs() {
 }
 
 async function loadRuns() {
-  const payload = await fetchJson('/api/v1/jobs?limit=20')
+  const payload = await fetchJson('/api/v1/ingest/jobs?limit=20')
   auditRuns.value = Array.isArray(payload.items) ? payload.items : []
 }
 
