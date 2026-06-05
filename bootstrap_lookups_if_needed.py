@@ -126,7 +126,7 @@ def main() -> int:
     missing_summary = ", ".join(sorted(missing_keys)) if missing_keys else "lookup_version"
     print(f"Lookup bootstrap required: missing keys/table for schema {schema}: {missing_summary}.")
     print("Running bootstrap_lookups.py.")
-    from etl.bootstrap.bootstrap_lookups import main as bootstrap_main
+    from nas_processor.etl.bootstrap.bootstrap_lookups import main as bootstrap_main
 
     bootstrap_main()
     return 0

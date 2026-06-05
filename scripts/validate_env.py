@@ -3,7 +3,7 @@ import os
 import sys
 from pathlib import Path
 
-from nas_core.config.env import validate_backend_env, validate_run_all_env
+from nas_config.env import validate_backend_env, validate_run_all_env
 
 
 def _load_env_file(env_path: Path) -> None:

@@ -49,7 +49,8 @@ python -m etl.pipeline --input <file> --config config/config.json --success outp
 python -m backend.app.maintenance.reindex_search --schema nas --es-url http://localhost:9200 --index nas_addresses --recreate-index
 
 # Full pipeline + load + reindex
-bash run_all.sh
+# ETL pipeline is now triggered via the ingest API (POST /api/v1/ingest/upload).
+# The worker processes it automatically.
 ```
 
 ### Frontend

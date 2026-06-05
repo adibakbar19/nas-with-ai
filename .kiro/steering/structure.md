@@ -55,7 +55,6 @@
 ├── Dockerfile.backend        # Backend image
 ├── alembic.ini               # Migration config
 ├── requirements.txt          # Python dependencies
-├── run_all.sh                # One-step ETL + load + reindex
 └── bootstrap_lookups_if_needed.py  # DB seeding entrypoint
 ```
 

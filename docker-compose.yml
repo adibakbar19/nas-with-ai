@@ -38,20 +38,59 @@ services:
     container_name: nas-valkey
     restart: unless-stopped
 
+  minio:
+    image: minio/minio:latest
+    container_name: nas-minio
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - minio_data:/data
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  keycloak:
+    image: quay.io/keycloak/keycloak:24.0
+    command: ["start-dev"]
+    volumes:
+      - keycloak_data:/opt/keycloak/data
+    container_name: nas-keycloak
+    ports:
+      - "8080:8080"
+    environment:
+      KEYCLOAK_ADMIN: admin
+      KEYCLOAK_ADMIN_PASSWORD: admin
+      KC_HOSTNAME_STRICT: "false"
+      KC_HTTP_ENABLED: "true"
+    healthcheck:
+      test: ["CMD-SHELL", "exec 3<>/dev/tcp/localhost/8080"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
+    restart: unless-stopped
+
   # ── One-shot setup ────────────────────────────────────────────────────────
   db-migrate:
     build:
       context: .
-      dockerfile: Dockerfile.backend
+      dockerfile: nas-processor/Dockerfile.migrate
     container_name: nas-db-migrate
-    env_file:
-      - .env
     environment:
       - PGHOST=postgres
       - PGPORT=5432
       - PGDATABASE=nas
       - PGUSER=nas
       - PGPASSWORD=nas
+      - PGSCHEMA=nas
     command: alembic upgrade head
     depends_on:
       postgres:
@@ -60,7 +99,7 @@ services:
   db-bootstrap:
     build:
       context: .
-      dockerfile: Dockerfile.backend
+      dockerfile: nas-processor/Dockerfile.bootstrap
     container_name: nas-db-bootstrap
     env_file:
       - .env
@@ -76,43 +115,11 @@ services:
         condition: service_completed_successfully
 
   # ── Application ───────────────────────────────────────────────────────────
-  api:
-    build:
-      context: .
-      dockerfile: Dockerfile.backend
-    container_name: nas-api
-    env_file:
-      - .env
-    environment:
-      - PGHOST=postgres
-      - PGPORT=5432
-      - PGDATABASE=nas
-      - PGUSER=nas
-      - PGPASSWORD=nas
-      - ES_URL=http://opensearch:9200
-      - VALKEY_URL=redis://valkey:6379/0
-      - VALKEY_STREAM_KEY=bulk_ingest_events
-      - VALKEY_STREAM_GROUP=bulk_ingest_workers
-      - INGEST_EXECUTION_MODE=queue_worker
-    command: uvicorn backend.app.main:app --host 0.0.0.0 --port 8000
-    ports:
-      - "8000:8000"
-    volumes:
-      - nas_output:/app/output
-      - nas_logs:/app/logs
-    depends_on:
-      db-bootstrap:
-        condition: service_completed_successfully
-      opensearch:
-        condition: service_healthy
-      valkey:
-        condition: service_started
-    restart: unless-stopped
 
   worker:
     build:
       context: .
-      dockerfile: Dockerfile.backend
+      dockerfile: Dockerfile.worker
     container_name: nas-worker
     env_file:
       - .env
@@ -122,13 +129,22 @@ services:
       - PGDATABASE=nas
       - PGUSER=nas
       - PGPASSWORD=nas
+      - PGSCHEMA=nas
+      - INGEST_JOB_STATE_SCHEMA=ingest
       - ES_URL=http://opensearch:9200
+      - OPENSEARCH_URL=http://opensearch:9200
+      - OPENSEARCH_INDEX=nas_addresses
       - VALKEY_URL=redis://valkey:6379/0
       - VALKEY_STREAM_KEY=bulk_ingest_events
       - VALKEY_STREAM_GROUP=bulk_ingest_workers
       - INGEST_EXECUTION_MODE=queue_worker
       - WORKER_METRICS_PORT=9101
-    command: python -m backend.app.workers.queue_consumer
+      - OBJECT_STORE_BUCKET=nas-uploads
+      - OBJECT_STORE_ENDPOINT=http://minio:9000
+      - OBJECT_STORE_SECURE=false
+      - OBJECT_STORE_USE_PATH_STYLE=true
+      - AWS_ACCESS_KEY_ID=minioadmin
+      - AWS_SECRET_ACCESS_KEY=minioadmin
     volumes:
       - nas_output:/app/output
       - nas_logs:/app/logs
@@ -137,6 +153,73 @@ services:
         condition: service_completed_successfully
       valkey:
         condition: service_started
+      opensearch:
+        condition: service_healthy
+    restart: unless-stopped
+
+  nas-matcher:
+    build:
+      context: .
+      dockerfile: Dockerfile.worker
+    container_name: nas-matcher
+    command: python -m nas_processor.src.matcher.worker
+    environment:
+      - PGHOST=postgres
+      - PGPORT=5432
+      - PGDATABASE=nas
+      - PGUSER=nas
+      - PGPASSWORD=nas
+      - PGSCHEMA=nas
+      - MATCHER_AUTO_THRESHOLD=0.92
+      - MATCHER_REVIEW_THRESHOLD=0.70
+      - MATCHER_BATCH_SIZE=100
+      - MATCHER_POLL_INTERVAL=5
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+
+  ingestion-api:
+    build:
+      context: ./ingestion-api
+    container_name: nas-ingestion-api
+    env_file:
+      - .env
+    ports:
+      - "3000:3000"
+    environment:
+      - KEYCLOAK_URL=http://keycloak:8080/realms/org-realm
+      - KEYCLOAK_AUDIENCE=ingestion-api
+      - REDIS_URL=redis://valkey:6379/0
+      - PGHOST=postgres
+      - PGPORT=5432
+      - PGDATABASE=nas
+      - PGUSER=nas
+      - PGPASSWORD=nas
+      - INGEST_JOB_STATE_SCHEMA=ingest
+      - VALKEY_URL=redis://valkey:6379/0
+      - VALKEY_STREAM_KEY=bulk_ingest_events
+      - VALKEY_STREAM_GROUP=bulk_ingest_workers
+      - OBJECT_STORE_BUCKET=nas-uploads
+      - OBJECT_STORE_ENDPOINT=http://minio:9000
+      - OBJECT_STORE_SECURE=false
+      - OBJECT_STORE_USE_PATH_STYLE=true
+      - AWS_ACCESS_KEY_ID=minioadmin
+      - AWS_SECRET_ACCESS_KEY=minioadmin
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:3000/health')\""]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    depends_on:
+      db-bootstrap:
+        condition: service_completed_successfully
+      valkey:
+        condition: service_started
+      keycloak:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
     restart: unless-stopped
 
   frontend:
@@ -149,12 +232,67 @@ services:
     ports:
       - "${FRONTEND_PORT:-80}:80"
     depends_on:
-      api:
+      ingestion-api:
+        condition: service_healthy
+    restart: unless-stopped
+
+  nas-processor-api:
+    build:
+      context: ./nas-processor
+      dockerfile: nas_processor/src/api/Dockerfile
+    container_name: nas-processor-api
+    env_file:
+      - .env
+    ports:
+      - "8001:8001"
+    environment:
+      - KEYCLOAK_URL=http://keycloak:8080/realms/org-realm
+      - KEYCLOAK_AUDIENCE=nas-processor-api
+      - REDIS_URL=redis://valkey:6379/0
+      - PGHOST=postgres
+      - PGPORT=5432
+      - PGDATABASE=nas
+      - PGUSER=nas
+      - PGPASSWORD=nas
+      - ES_URL=http://opensearch:9200
+      - ES_INDEX=nas_addresses
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8001/health')\""]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    depends_on:
+      keycloak:
+        condition: service_healthy
+      valkey:
+        condition: service_started
+    restart: unless-stopped
+
+  autocomplete-service:
+    build:
+      context: ./autocomplete-service
+    container_name: nas-autocomplete
+    ports:
+      - "8002:8002"
+    environment:
+      - OPENSEARCH_URL=http://opensearch:9200
+      - REDIS_URL=redis://valkey:6379/0
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8002/health')\""]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    depends_on:
+      opensearch:
+        condition: service_healthy
+      valkey:
         condition: service_started
     restart: unless-stopped
 
 volumes:
   postgres_data:
   opensearch_data:
+  keycloak_data:
+  minio_data:
   nas_output:
   nas_logs:

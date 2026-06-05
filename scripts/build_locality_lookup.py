@@ -6,7 +6,7 @@ import re
 from glob import glob
 from typing import Dict, Iterable, Iterator, Tuple
 
-from etl.transform.address.replacements import (
+from nas_processor.etl.transform.address.replacements import (
     LOCALITY_ABBREVIATION_REPLACEMENTS,
     LOCALITY_INVALID_PREFIXES,
     LOCALITY_PLACEHOLDER_VALUES,

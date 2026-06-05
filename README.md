@@ -187,13 +187,11 @@ python -m etl.pipeline \
 
 Checkpoint stages: `10_extract_raw` → `20_clean` → `30_validated_success` / `31_validated_failed` → `40_success_final` / `41_failed_final`
 
-### One-step run
+### Running the Pipeline
 
-```bash
-bash run_all.sh
-```
+ETL pipeline is now triggered via the ingest API. Upload a file via `POST /api/v1/ingest/upload` and the worker processes it automatically.
 
-`run_all.sh` runs ETL → Postgres load → OpenSearch reindex. Required: `PIPELINE_INPUT`. Optional: `PIPELINE_SOURCE_TYPE`, `PIPELINE_RESUME`, `PIPELINE_CHECKPOINT_ROOT`, `PIPELINE_RESUME_FAILED_ONLY`.
+Environment variables `PIPELINE_SOURCE_TYPE`, `PIPELINE_RESUME`, `PIPELINE_CHECKPOINT_ROOT`, and `PIPELINE_RESUME_FAILED_ONLY` are configured per-job through the API.
 
 ## Backend API
 

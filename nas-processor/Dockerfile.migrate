@@ -1,0 +1,20 @@
+FROM python:3.12-slim
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1
+
+WORKDIR /app
+
+# Install Alembic + psycopg driver
+RUN pip install --no-cache-dir alembic "psycopg[binary]"
+
+# Install shared nas_config package (provides build_dsn)
+COPY shared/nas_config/ ./shared/nas_config/
+RUN pip install --no-cache-dir -e shared/nas_config
+
+# Copy migration files
+COPY nas-processor/alembic.ini ./alembic.ini
+COPY nas-processor/alembic/ ./alembic/
+COPY nas-processor/migration_settings.py ./migration_settings.py
+
+CMD ["alembic", "upgrade", "head"]

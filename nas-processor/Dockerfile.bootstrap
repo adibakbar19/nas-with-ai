@@ -1,0 +1,26 @@
+FROM python:3.12-slim
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1
+
+WORKDIR /app
+
+COPY requirements.txt ./
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Install shared packages
+COPY shared/ ./shared/
+RUN pip install --no-cache-dir -e shared/nas_config -e shared/nas_contracts
+
+# Install nas-processor package (includes etl/)
+COPY nas-processor/ ./nas-processor/
+RUN pip install --no-cache-dir -e nas-processor
+
+# Copy config and data for lookup seeding
+COPY config/ ./config/
+COPY data/ ./data/
+
+# Copy bootstrap script
+COPY bootstrap_lookups_if_needed.py ./
+
+CMD ["python", "bootstrap_lookups_if_needed.py"]
