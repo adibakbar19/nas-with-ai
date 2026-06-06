@@ -26,6 +26,7 @@ from ..transform.address.normalise import normalise_chunk
 from ..transform.address.lookup import enrich_lookup
 from ..transform.correction import write_correction_csvs
 from .enrichers import AddressEnricher, NoOpEnricher
+from .stages.classify import classify_dataframe, load_type_id_map, resolve_type_ids
 from .stages.extract import extract_chunks
 from .stages.validate import validate_chunk
 from .stages.naskod import assign_naskod
@@ -178,6 +179,10 @@ def run_pipeline(
     # DSN from env
     dsn = build_dsn(driver="psycopg")
 
+    # Load address type lookup map (once) — used in classify stage per chunk
+    type_id_map = load_type_id_map(dsn=dsn, schema=schema)
+    logger.info("address_type_map_loaded types=%d", len(type_id_map))
+
     # Track totals
     totals = {
         "total_rows": 0,
@@ -243,6 +248,20 @@ def run_pipeline(
             success = assign_naskod(success, naskod_repo=naskod_repo)
         if not warning.is_empty():
             warning = assign_naskod(warning, naskod_repo=naskod_repo)
+
+        # 7b. Classify address type (success + warning only)
+        if not success.is_empty():
+            success = classify_dataframe(success)
+            success = resolve_type_ids(success, type_id_map)
+        if not warning.is_empty():
+            warning = classify_dataframe(warning)
+            warning = resolve_type_ids(warning, type_id_map)
+        logger.info(
+            "classify_complete chunk=%d success_typed=%d warning_typed=%d",
+            chunk_num,
+            0 if success.is_empty() else success.filter(pl.col("address_type_id").is_not_null()).height,
+            0 if warning.is_empty() else warning.filter(pl.col("address_type_id").is_not_null()).height,
+        )
 
         # 8. Load to DB (success + warning + failed→raw_address)
         if not success.is_empty() or not warning.is_empty() or not failed.is_empty():

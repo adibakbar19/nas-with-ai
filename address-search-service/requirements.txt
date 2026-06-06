@@ -1,0 +1,10 @@
+fastapi
+uvicorn[standard]
+opensearch-py
+psycopg2-binary
+sqlalchemy
+redis
+pydantic
+pydantic-settings
+python-multipart
+httpx

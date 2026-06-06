@@ -289,6 +289,35 @@ services:
         condition: service_started
     restart: unless-stopped
 
+  address-search-service:
+    build:
+      context: ./address-search-service
+      dockerfile: Dockerfile
+    container_name: nas-address-search
+    ports:
+      - "8003:8003"
+    environment:
+      - SEARCH_OPENSEARCH_URL=http://opensearch:9200
+      - SEARCH_OPENSEARCH_INDEX=nas_addresses
+      - SEARCH_POSTGRES_DSN=postgresql://nas:nas@postgres:5432/nas
+      - SEARCH_REDIS_URL=redis://valkey:6379/0
+      - SEARCH_AUTH_ENABLED=false
+      - SEARCH_LOG_LEVEL=info
+      - SEARCH_PORT=8003
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8003/ready"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+    depends_on:
+      opensearch:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+      valkey:
+        condition: service_started
+    restart: unless-stopped
+
 volumes:
   postgres_data:
   opensearch_data:

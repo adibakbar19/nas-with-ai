@@ -62,6 +62,10 @@ async def lifespan(app: FastAPI):
         lookup_schema=lookup_schema,
     )
 
+    # Review queue — just store dsn/schema; repository functions are called directly
+    app.state.review_dsn = dsn
+    app.state.review_schema = schema
+
     yield
 
     # ── Shutdown ─────────────────────────────────────────────────────────
@@ -89,11 +93,13 @@ from nas_processor.src.api.routes.search import router as search_router  # noqa:
 from nas_processor.src.api.routes.address import router as address_router  # noqa: E402
 from nas_processor.src.api.routes.admin_lookup import router as admin_lookup_router  # noqa: E402
 from nas_processor.src.api.routes.admin_boundary import router as admin_boundary_router  # noqa: E402
+from nas_processor.src.api.routes.review import router as review_router  # noqa: E402
 
 app.include_router(search_router)
 app.include_router(address_router)
 app.include_router(admin_lookup_router)
 app.include_router(admin_boundary_router)
+app.include_router(review_router)
 
 
 @app.get("/health")

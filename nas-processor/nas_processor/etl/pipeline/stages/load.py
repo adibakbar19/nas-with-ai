@@ -109,8 +109,14 @@ def _build_upsert_sql(
         if col == PRIMARY_KEY:
             continue
         if col == _NASKOD_COL:
+            # naskod: preserve existing (once assigned it never changes)
             update_clauses.append(
                 f"{_quote(col)} = COALESCE({target_ref}.{_quote(col)}, EXCLUDED.{_quote(col)})"
+            )
+        elif col == "address_type_id":
+            # address_type_id: prefer new classification, fall back to existing
+            update_clauses.append(
+                f"{_quote(col)} = COALESCE(EXCLUDED.{_quote(col)}, {target_ref}.{_quote(col)})"
             )
         else:
             update_clauses.append(f"{_quote(col)} = EXCLUDED.{_quote(col)}")
@@ -395,9 +401,10 @@ def load_chunk(
     if raw_df is not None and not raw_df.is_empty():
         _assert_table_exists(engine, schema, "raw_address")
 
-    # 4. Determine upsertable columns (exclude columns needing special DB types)
-    # geom = PostGIS geometry, timestamp columns default in DB, address_type_id = FK
-    _SKIP_WRITE_COLUMNS = {"geom", "validation_date", "created_at", "updated_at", "address_type_id"}
+    # 4. Determine upsertable columns (exclude columns needing special DB handling)
+    # geom = PostGIS geometry (requires ST_GeomFromText), timestamp columns default in DB
+    # address_type_id is now written — classifier populates it as Int32
+    _SKIP_WRITE_COLUMNS = {"geom", "validation_date", "created_at", "updated_at"}
     upsert_columns = [
         c for c in STANDARDIZED_ADDRESS_COLUMNS
         if c in mapped_df.columns and c not in _SKIP_WRITE_COLUMNS

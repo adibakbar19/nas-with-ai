@@ -96,11 +96,26 @@ class AddressMatcher:
         elif best_score >= cfg.review_threshold:
             update_needs_review(raw_id=raw_id, dsn=cfg.dsn, schema=cfg.schema)
             top3 = ranked[:3]
+
+            # Build a descriptive reason so reviewers immediately see WHY it needs review
+            reason_parts = [f"best_score={best_score:.2f}"]
+            top_cand = best_candidate
+            if top_cand.get("postcode") and row.get("postcode"):
+                reason_parts.append(
+                    "postcode_match" if top_cand["postcode"] == row["postcode"] else "postcode_differs"
+                )
+            if top_cand.get("state_code") and row.get("state_code"):
+                reason_parts.append(
+                    "state_match" if top_cand["state_code"] == row["state_code"] else "state_differs"
+                )
+            if len(ranked) > 1 and ranked[1][1] >= cfg.review_threshold:
+                reason_parts.append("multiple_candidates_above_threshold")
+
             insert_review(
                 raw_id=raw_id,
                 candidate_ids=[c["record_id"] for c, _ in top3],
                 candidate_scores=[s for _, s in top3],
-                reason=f"top_score={best_score:.2f}_needs_human_review",
+                reason=" | ".join(reason_parts),
                 dsn=cfg.dsn,
                 schema=cfg.schema,
             )
