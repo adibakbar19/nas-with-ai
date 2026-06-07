@@ -13,6 +13,7 @@ from config import settings
 from src.auth.jwks_cache import JWKSCache
 from src.errors import ServiceError
 from src.queue.producer import ValkeyStreamQueueProducer
+from src.queue.queue_client import QueueServiceClient
 from src.repositories.api_idempotency_repository import ApiIdempotencyRepository
 from src.repositories.multipart_upload_repository import MultipartUploadRepository
 from src.services.ingest_service import IngestService
@@ -44,10 +45,15 @@ async def lifespan(app: FastAPI):
         valkey_url=settings.VALKEY_URL,
         stream_key=settings.VALKEY_STREAM_KEY,
     )
+    queue_client = QueueServiceClient(
+        base_url=settings.QUEUE_SERVICE_URL,
+        service_key=settings.QUEUE_SERVICE_KEY,
+    )
     job_state = IngestJobState(
         job_repo=job_repo,
         producer=producer,
         object_store_bucket=object_store.bucket,
+        queue_client=queue_client,
     )
     multipart_repo = MultipartUploadRepository(dsn=dsn, schema=schema)
     idempotency_repo = ApiIdempotencyRepository(dsn=dsn, schema=schema)

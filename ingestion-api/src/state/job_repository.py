@@ -181,7 +181,7 @@ class IngestJobStateRepository:
     ) -> dict[str, Any] | None:
         assert sql is not None
         select_stmt = sql.SQL(
-            "SELECT job_id, agency_id, status, created_at, updated_at, data FROM {} WHERE job_id = %s FOR UPDATE"
+            "SELECT job_id, agency_id, status, created_at, updated_at, data FROM {} WHERE job_id = %s FOR UPDATE SKIP LOCKED"
         ).format(self._tbl())
         update_stmt = sql.SQL(
             """

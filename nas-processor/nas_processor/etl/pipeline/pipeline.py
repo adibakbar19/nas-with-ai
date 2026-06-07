@@ -27,11 +27,12 @@ from ..transform.address.lookup import enrich_lookup
 from ..transform.correction import write_correction_csvs
 from .enrichers import AddressEnricher, NoOpEnricher
 from .stages.classify import classify_dataframe, load_type_id_map, resolve_type_ids
+from .stages.coordinate import _count_level, enrich_coordinates, load_centroid_cache
 from .stages.extract import extract_chunks
-from .stages.validate import validate_chunk
-from .stages.naskod import assign_naskod
 from .stages.load import load_success_and_warning
+from .stages.naskod import assign_naskod
 from .stages.spatial import enrich_spatial
+from .stages.validate import validate_chunk
 
 logger = logging.getLogger(__name__)
 
@@ -56,6 +57,18 @@ except ImportError:
             if extra:
                 parts += " " + " ".join(f"{k}={v}" for k, v in extra.items())
             print(f"STAGE_METRICS stage={stage} {parts}", flush=True)
+
+
+# ── Column detection helper ───────────────────────────────────────────────────
+
+
+def _detect_col(columns: list[str], candidates: list[str]) -> str | None:
+    """Return the first candidate column name present in columns (case-insensitive)."""
+    lower_cols = {c.lower(): c for c in columns}
+    for candidate in candidates:
+        if candidate.lower() in lower_cols:
+            return lower_cols[candidate.lower()]
+    return None
 
 
 # ── Reference data loading ────────────────────────────────────────────────────
@@ -183,6 +196,9 @@ def run_pipeline(
     type_id_map = load_type_id_map(dsn=dsn, schema=schema)
     logger.info("address_type_map_loaded types=%d", len(type_id_map))
 
+    # Load centroid cache (once) — used in coordinate enrichment per chunk
+    centroid_cache = load_centroid_cache(dsn=dsn)
+
     # Track totals
     totals = {
         "total_rows": 0,
@@ -195,6 +211,8 @@ def run_pipeline(
 
     # Track original columns from source file (for correction CSVs)
     original_columns: list[str] = []
+    lat_col: str | None = None
+    lon_col: str | None = None
 
     # Stream chunks
     chunk_num = 0
@@ -206,6 +224,17 @@ def run_pipeline(
         # Capture original columns from first chunk
         if not original_columns:
             original_columns = [c for c in chunk.columns if c != "record_id"]
+            # Detect source lat/lon columns once (from raw input, before enrichment renames them)
+            lat_col = _detect_col(chunk.columns, [
+                "latitude", "lat", "y_coord", "y", "koordinat_y", "latitud",
+            ])
+            lon_col = _detect_col(chunk.columns, [
+                "longitude", "lon", "lng", "x_coord", "x", "koordinat_x", "longitud",
+            ])
+            if lat_col or lon_col:
+                logger.info(
+                    "coordinate_source_columns lat=%s lon=%s", lat_col, lon_col
+                )
 
         progress.on_stage_start(f"chunk_{chunk_num}")
         logger.info("chunk_start chunk=%d rows=%d", chunk_num, chunk_rows)
@@ -234,11 +263,19 @@ def run_pipeline(
         # 4. AI enrichment (NoOp by default)
         chunk = enricher.enrich(chunk)
 
-        # 5. Spatial enrichment (PostGIS boundary joins — coordinates only)
+        # 5. Spatial enrichment (PostGIS boundary joins for rows WITH coordinates)
         if not skip_spatial:
             chunk = enrich_spatial(chunk, dsn=dsn, lookup_schema="nas_lookup")
         else:
             logger.debug("spatial_skipped reason=--no-spatial flag")
+
+        # 5b. Coordinate enrichment — assign lat/lon from centroids for rows WITHOUT coordinates
+        chunk = enrich_coordinates(
+            chunk,
+            centroid_cache,
+            source_lat_col=lat_col,
+            source_lon_col=lon_col,
+        )
 
         # 6. Validate → split
         success, warning, failed = validate_chunk(chunk)
@@ -261,6 +298,17 @@ def run_pipeline(
             chunk_num,
             0 if success.is_empty() else success.filter(pl.col("address_type_id").is_not_null()).height,
             0 if warning.is_empty() else warning.filter(pl.col("address_type_id").is_not_null()).height,
+        )
+        logger.info(
+            "coordinate_enrich chunk=%d rooftop=%d mukim=%d postcode=%d "
+            "district=%d state=%d none=%d",
+            chunk_num,
+            _count_level(success, warning, level="rooftop"),
+            _count_level(success, warning, level="mukim_centroid"),
+            _count_level(success, warning, level="postcode_centroid"),
+            _count_level(success, warning, level="district_centroid"),
+            _count_level(success, warning, level="state_centroid"),
+            _count_level(success, warning, level=None),
         )
 
         # 8. Load to DB (success + warning + failed→raw_address)

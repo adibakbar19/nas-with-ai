@@ -9,6 +9,7 @@ Never raises — returns (None, None) on any error or ambiguous input.
 from __future__ import annotations
 
 import logging
+import re
 from typing import Any
 
 import polars as pl
@@ -24,6 +25,7 @@ _CLASSIFY_FIELDS = [
     "sub_locality_1",
     "sub_locality_2",
     "premise_no",
+    "lot_no",
     "unit_no",
     "floor_no",
     "postcode",
@@ -51,6 +53,17 @@ def detect_address_type(row: dict) -> tuple[str, str] | tuple[None, None]:
         ]
         parts = [str(f).strip() for f in fields if f]
         if not parts:
+            # No text — try postcode-only tiebreaker (DMS 2039 §8.3)
+            _pc = str(row.get("postcode") or "").strip()
+            if _pc and len(_pc) >= 3:
+                try:
+                    _zone = int(_pc[-3:])
+                    if 500 <= _zone <= 699:
+                        return ("government", "federal")
+                    if 700 <= _zone <= 999:
+                        return ("po_box", "po_box")
+                except ValueError:
+                    pass
             return (None, None)
 
         search = " ".join(parts).lower()
@@ -153,6 +166,11 @@ def detect_address_type(row: dict) -> tuple[str, str] | tuple[None, None]:
             return ("poi", "toll")
 
         # ── 5. COMMERCIAL (building/brand signals) ────────────────────────────
+        # Street-type prefix signals (DMS 2039 §8.2): these road types are
+        # almost exclusively found in commercial/office precincts in Malaysia.
+        if "persiaran" in search or "lebuh" in search or "leboh" in search or "dataran" in search:
+            return ("commercial", "office")
+
         if "hotel" in search or " inn " in search or "resort" in search or "motel" in search:
             return ("commercial", "hotel")
         if "mall" in search or "shopping" in search or "pasaraya" in search:
@@ -173,9 +191,19 @@ def detect_address_type(row: dict) -> tuple[str, str] | tuple[None, None]:
         if " flat " in search or search.startswith("flat "):
             return ("residential", "flat")
 
+        # "lorong" (lane/alley) is a residential street type in Malaysia
+        if "lorong" in search:
+            return ("residential", "landed")
+
+        # "taman" in street_name → housing estate street → landed residential
+        street = str(row.get("street_name") or "").lower()
+        if "taman" in street:
+            return ("residential", "landed")
+
         unit_no = row.get("unit_no")
         floor_no = row.get("floor_no")
         premise_no = row.get("premise_no")
+        lot_no = row.get("lot_no")
 
         if unit_no and floor_no:
             return ("residential", "apartment")
@@ -183,10 +211,12 @@ def detect_address_type(row: dict) -> tuple[str, str] | tuple[None, None]:
             return ("residential", "apartment")
         if premise_no:
             return ("residential", "landed")
+        if lot_no:
+            return ("residential", "landed")
 
-        # If address_clean starts with a digit it's likely a numbered street address
+        # Digit-start fallback — numbered street address (§8.1)
         address_clean = str(row.get("address_clean") or row.get("full_address") or "").strip()
-        if address_clean and address_clean[0].isdigit():
+        if re.match(r'^\d', address_clean):
             return ("residential", "landed")
 
         # "taman" in sub-locality → housing area → landed residential
@@ -194,6 +224,19 @@ def detect_address_type(row: dict) -> tuple[str, str] | tuple[None, None]:
         sub2 = str(row.get("sub_locality_2") or "").lower()
         if "taman" in sub1 or "taman" in sub2:
             return ("residential", "landed")
+
+        # ── Postcode zone tiebreaker (DMS 2039 §8.3) ─────────────────────────
+        # Use last 3 digits only — does not override keyword matches above.
+        postcode = str(row.get("postcode") or "").strip()
+        if postcode and len(postcode) >= 3:
+            try:
+                zone = int(postcode[-3:])
+                if 500 <= zone <= 699:
+                    return ("government", "federal")
+                if 700 <= zone <= 999:
+                    return ("po_box", "po_box")
+            except ValueError:
+                pass
 
         return (None, None)
 

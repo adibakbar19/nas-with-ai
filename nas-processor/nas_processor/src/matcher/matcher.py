@@ -92,6 +92,21 @@ class AddressMatcher:
                 "auto_matched raw_id=%s standardized_id=%s score=%.4f alias_type=%s",
                 raw_id, best_candidate["record_id"], best_score, alias_type,
             )
+            try:
+                from nas_processor.src.events.publisher import publish as _publish_event
+                _publish_event(
+                    "match.auto_matched",
+                    entity_id=raw_id,
+                    entity_type="raw_address",
+                    payload={
+                        "raw_id":           raw_id,
+                        "standardized_id":  best_candidate["record_id"],
+                        "confidence":       best_score,
+                        "agency_id":        row.get("agency_id"),
+                    },
+                )
+            except Exception:
+                pass
 
         elif best_score >= cfg.review_threshold:
             update_needs_review(raw_id=raw_id, dsn=cfg.dsn, schema=cfg.schema)
@@ -123,6 +138,20 @@ class AddressMatcher:
                 "review_queued raw_id=%s top_score=%.4f candidates=%d",
                 raw_id, best_score, len(top3),
             )
+            try:
+                from nas_processor.src.events.publisher import publish as _publish_event
+                _publish_event(
+                    "match.needs_review",
+                    entity_id=raw_id,
+                    entity_type="raw_address",
+                    payload={
+                        "raw_id":     raw_id,
+                        "reason":     " | ".join(reason_parts),
+                        "top_score":  best_score,
+                    },
+                )
+            except Exception:
+                pass
 
         else:
             # Best score too low — raw address represents a genuinely new canonical record

@@ -20,7 +20,8 @@ _SELECT_COLS = """
     s.building_name, s.sub_locality_1, s.sub_locality_2, s.sub_locality_3,
     s.locality_name, s.postcode, s.postcode_name, s.state_code, s.state_name,
     s.mukim_name, s.district_name, s.pbt_name,
-    s.confidence_band, s.confidence_score, s.lifecycle_status, s.address_type_id
+    s.confidence_band, s.confidence_score, s.lifecycle_status, s.address_type_id,
+    s.latitude, s.longitude, s.coordinate_level
 """
 
 # Index mappings — autocomplete must be search_as_you_type so the autocomplete-service
@@ -28,18 +29,22 @@ _SELECT_COLS = """
 _INDEX_MAPPINGS = {
     "mappings": {
         "properties": {
-            "autocomplete":      {"type": "search_as_you_type"},
-            "address_clean":     {"type": "text", "fields": {"keyword": {"type": "keyword", "ignore_above": 512}}},
-            "street_name":       {"type": "text", "fields": {"keyword": {"type": "keyword", "ignore_above": 256}}},
-            "locality_name":     {"type": "text", "fields": {"keyword": {"type": "keyword", "ignore_above": 256}}},
-            "postcode":          {"type": "keyword"},
-            "state_code":        {"type": "keyword"},
-            "naskod":            {"type": "keyword"},
-            "confidence_band":   {"type": "keyword"},
-            "confidence_score":  {"type": "float"},
-            "lifecycle_status":  {"type": "keyword"},
-            "record_id":         {"type": "keyword"},
-            "address_type_id":   {"type": "integer"},
+            "autocomplete":       {"type": "search_as_you_type"},
+            "address_clean":      {"type": "text", "fields": {"keyword": {"type": "keyword", "ignore_above": 512}}},
+            "street_name":        {"type": "text", "fields": {"keyword": {"type": "keyword", "ignore_above": 256}}},
+            "locality_name":      {"type": "text", "fields": {"keyword": {"type": "keyword", "ignore_above": 256}}},
+            "postcode":           {"type": "keyword"},
+            "state_code":         {"type": "keyword"},
+            "naskod":             {"type": "keyword"},
+            "confidence_band":    {"type": "keyword"},
+            "confidence_score":   {"type": "float"},
+            "lifecycle_status":   {"type": "keyword"},
+            "record_id":          {"type": "keyword"},
+            "address_type_id":    {"type": "integer"},
+            "location":           {"type": "geo_point"},
+            "coordinate_level":   {"type": "keyword"},
+            "latitude":           {"type": "float"},
+            "longitude":          {"type": "float"},
         }
     }
 }
@@ -141,14 +146,27 @@ def count_all_addresses(*, dsn: str, schema: str = "nas") -> int:
 def _to_action(doc: dict, index_name: str) -> dict:
     """Convert a DB row dict to an opensearch-py bulk action."""
     address_clean = doc.get("address_clean") or ""
+
+    lat = doc.get("latitude")
+    lon = doc.get("longitude")
+    location = (
+        {"lat": float(lat), "lon": float(lon)}
+        if lat is not None and lon is not None
+        else None
+    )
+
+    source = dict(doc)
+    source["autocomplete"] = address_clean
+    source["location"] = location
+    source["coordinate_level"] = doc.get("coordinate_level")
+    # Keep lat/lon as numeric fields for display; location is used for geo queries
+    source["latitude"] = float(doc["latitude"]) if doc.get("latitude") is not None else None
+    source["longitude"] = float(doc["longitude"]) if doc.get("longitude") is not None else None
+
     return {
         "_index": index_name,
         "_id": doc["record_id"],
-        "_source": {
-            **doc,
-            # autocomplete must be populated for search_as_you_type sub-fields
-            "autocomplete": address_clean,
-        },
+        "_source": source,
     }
 
 

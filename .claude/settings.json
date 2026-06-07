@@ -1,0 +1,16 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(curl -s \"http://localhost:9200/nas_addresses/_search?pretty=true&_source=address_clean,location,coordinate_level&size=2\")",
+      "Bash(python3 -c ' *)",
+      "Bash(curl -s 'http://localhost:8003/spatial/nearby?lat=3.1370&lon=101.7342&radius_m=5000')",
+      "Bash(curl -s \"http://localhost:8003/spatial/nearby?lat=3.1466&lon=101.7113&radius_m=2000\")",
+      "Bash(curl -s \"http://localhost:8003/geocode/reverse?lat=3.1528&lon=101.7038\")",
+      "Bash(../.venv/bin/python -m pytest tests/test_classify.py -v)",
+      "Bash(curl -sf http://localhost:8004/health)",
+      "Bash(curl -s http://localhost:8004/health)",
+      "Bash(curl -sf http://localhost:8004/ready)",
+      "Bash(curl -s -X POST http://localhost:8004/webhooks -H 'Content-Type: application/json' -H 'X-API-Key: dev-key-001' -d '{ *)"
+    ]
+  }
+}

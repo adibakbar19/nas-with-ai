@@ -64,5 +64,9 @@ class Settings:
     VALKEY_STREAM_KEY: str = os.environ.get("VALKEY_STREAM_KEY", "bulk_ingest_events")
     VALKEY_STREAM_GROUP: str = os.environ.get("VALKEY_STREAM_GROUP", "bulk_ingest_workers")
 
+    # Queue service (preferred enqueue path — falls back to direct Valkey if unavailable)
+    QUEUE_SERVICE_URL: str = os.environ.get("QUEUE_SERVICE_URL", "http://queue-service:8005")
+    QUEUE_SERVICE_KEY: str = os.environ.get("QUEUE_SERVICE_KEY", "internal-dev-key")
+
 
 settings = Settings()

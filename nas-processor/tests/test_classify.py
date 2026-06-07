@@ -10,19 +10,27 @@ import pytest
 from nas_processor.etl.pipeline.stages.classify import detect_address_type
 
 
-def detect(text: str | None) -> tuple[str | None, str | None]:
-    """Helper: call detect_address_type with only address_clean set."""
-    return detect_address_type({
-        "address_clean": text,
-        "building_name": None,
-        "street_name": None,
-        "sub_locality_1": None,
-        "sub_locality_2": None,
-        "premise_no": None,
-        "unit_no": None,
-        "floor_no": None,
-        "postcode": None,
-    })
+_DEFAULTS = {
+    "address_clean": None,
+    "building_name": None,
+    "street_name": None,
+    "sub_locality_1": None,
+    "sub_locality_2": None,
+    "premise_no": None,
+    "lot_no": None,
+    "unit_no": None,
+    "floor_no": None,
+    "postcode": None,
+}
+
+
+def detect(text_or_row) -> tuple[str | None, str | None]:
+    """Helper: accepts a string (address_clean only) or a full field dict."""
+    if isinstance(text_or_row, dict):
+        row = {**_DEFAULTS, **text_or_row}
+    else:
+        row = {**_DEFAULTS, "address_clean": text_or_row}
+    return detect_address_type(row)
 
 
 # ── PO BOX ────────────────────────────────────────────────────────────────────
@@ -188,3 +196,83 @@ def test_government_wins_before_commercial_kompleks():
 def test_never_raises_on_garbage():
     result = detect_address_type({"address_clean": 12345, "unknown_key": object()})
     assert result == (None, None) or isinstance(result, tuple)
+
+
+# ── NEW: street prefix signals ────────────────────────────────────────────────
+
+def test_commercial_persiaran():
+    assert detect({"address_clean": "LOT 3A PERSIARAN KEWAJIPAN USJ 1 47600"}) == ("commercial", "office")
+
+def test_commercial_lebuh():
+    assert detect({"address_clean": "12 Lebuh Ampang 50100 Kuala Lumpur"}) == ("commercial", "office")
+
+def test_commercial_leboh():
+    assert detect({"address_clean": "Leboh Chulia Penang"}) == ("commercial", "office")
+
+def test_commercial_dataran():
+    assert detect({"address_clean": "Dataran KLCC 50450 Kuala Lumpur"}) == ("commercial", "office")
+
+
+# ── NEW: residential street signals ──────────────────────────────────────────
+
+def test_residential_lorong():
+    assert detect({"address_clean": "NO 8 LORONG DELIMA 11700 GELUGOR"}) == ("residential", "landed")
+
+def test_residential_lorong_in_street_name():
+    result = detect_address_type({
+        **_DEFAULTS,
+        "address_clean": "Residensi Delima",
+        "street_name": "Lorong Delima 3",
+    })
+    assert result == ("residential", "landed")
+
+def test_residential_taman_in_street_name():
+    result = detect_address_type({
+        **_DEFAULTS,
+        "address_clean": "No 5 Jalan Harmoni",
+        "street_name": "Taman Bukit Indah",
+    })
+    assert result == ("residential", "landed")
+
+
+# ── NEW: digit-start fallback ─────────────────────────────────────────────────
+
+def test_residential_digit_start_fallback():
+    assert detect({"address_clean": "12 JALAN BUKIT BINTANG 55100"}) == ("residential", "landed")
+
+
+# ── NEW: lot_no fallback ──────────────────────────────────────────────────────
+
+def test_residential_lot_no_fallback():
+    # No keyword match in address_clean → lot_no triggers residential/landed
+    result = detect_address_type({
+        **_DEFAULTS,
+        "address_clean": "PT 1234 Sungai Buloh",
+        "lot_no": "PT1234",
+    })
+    assert result == ("residential", "landed")
+
+
+# ── NEW: postcode zone tiebreaker ─────────────────────────────────────────────
+
+def test_government_postcode_zone_500_699():
+    # postcode 62514: last 3 digits = 514 → government zone, AND "jabatan" keyword
+    assert detect({
+        "address_clean": "Lot 5 Jabatan Imigresen",
+        "postcode": "62514",
+    }) == ("government", "federal")
+
+def test_postcode_zone_tiebreaker_no_keyword():
+    # No keyword match — postcode last 3 digits 550 → government zone tiebreaker
+    assert detect({"postcode": "62550"}) == ("government", "federal")
+
+def test_postcode_zone_700_999_po_box():
+    # last 3 digits 810 → po_box zone tiebreaker
+    assert detect({"postcode": "50810"}) == ("po_box", "po_box")
+
+def test_postcode_zone_does_not_override_keyword():
+    # "kampung" keyword wins — postcode zone is tiebreaker only
+    assert detect({
+        "address_clean": "Kampung Baru 50300",
+        "postcode": "50810",  # po_box zone, but keyword wins
+    }) == ("rural", "kampung")

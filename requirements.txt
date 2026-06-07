@@ -19,3 +19,4 @@ boto3
 redis
 rapidfuzz
 opensearch-py
+confluent-kafka>=2.3.0

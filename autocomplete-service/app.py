@@ -31,6 +31,20 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="Autocomplete Service", lifespan=lifespan)
 
 
+@app.middleware("http")
+async def add_deprecation_header(request: Request, call_next):
+    response = await call_next(request)
+    response.headers["Deprecation"] = "true"
+    response.headers["Sunset"] = "Sat, 01 Aug 2026 00:00:00 GMT"
+    response.headers["Link"] = '<http://localhost:8003>; rel="successor-version"'
+    response.headers["X-Deprecation-Notice"] = (
+        "This service is deprecated. "
+        "Migrate to address-search-service port 8003. "
+        "Equivalent endpoint: GET /autocomplete"
+    )
+    return response
+
+
 @app.get("/health")
 async def health():
     """Liveness probe."""

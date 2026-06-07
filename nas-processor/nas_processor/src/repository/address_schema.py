@@ -1,7 +1,7 @@
 """Canonical schema definitions for nas.standardized_address and nas.raw_address.
 
 Single source of truth for column names, types, and validation rules.
-Matches the Alembic migrations through 20260606_0007.
+Matches the Alembic migrations through 20260606_0009.
 """
 
 from __future__ import annotations
@@ -50,6 +50,7 @@ STANDARDIZED_ADDRESS_COLUMNS: list[str] = [
     "latitude",
     "longitude",
     "geom",
+    "coordinate_level",
     # Classification
     "address_type_id",
     "address_clean",

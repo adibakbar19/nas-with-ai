@@ -11,6 +11,7 @@ import os
 import re
 import socket
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -215,18 +216,38 @@ class IngestWorker:
             logger.warning("unknown_event_type event_type=%s", event_type)
             return None
 
-        job = self._job_repo.get_job(job_id=job_id)
+        # Phase 3: get job via queue-service (falls back to direct DB in _job_repo)
+        job = None
+        if hasattr(self._runner, "_jobs") and hasattr(self._runner._jobs, "_qc"):
+            job = self._runner._jobs._qc.get_job(job_id)
+        if job is None:
+            job = self._job_repo.get_job(job_id=job_id)
         if not job:
             logger.warning("job_not_found job_id=%s", job_id)
             return None
 
-        claimed = self._job_repo.claim_job(
-            job_id=job_id,
-            worker_id=self._worker_id,
-            expected_statuses=("queued",),
-            queue_event_id=str(event.get("event_id") or "").strip() or None,
-            queue_message_id=delivery_id,
-        )
+        # Claim the job — mark it running via queue-service first, then fall back
+        claimed = False
+        if hasattr(self._runner, "_jobs") and hasattr(self._runner._jobs, "_qc"):
+            # Optimistic claim via progress update
+            self._runner._jobs._qc.update_progress(
+                job_id, self._worker_id,
+                status="running",
+                claimed_by=self._worker_id,
+                claimed_at=datetime.now(timezone.utc).isoformat(),
+                heartbeat_at=datetime.now(timezone.utc).isoformat(),
+            )
+            claimed = True
+        else:
+            claimed_row = self._job_repo.claim_job(
+                job_id=job_id,
+                worker_id=self._worker_id,
+                expected_statuses=("queued",),
+                queue_event_id=str(event.get("event_id") or "").strip() or None,
+                queue_message_id=delivery_id,
+            )
+            claimed = claimed_row is not None
+
         if not claimed:
             logger.info("skip_unclaimed job_id=%s delivery_id=%s", job_id, delivery_id)
             return None
@@ -275,20 +296,26 @@ def main() -> None:
         persist_live_interval_seconds=float(os.getenv("INGEST_PERSIST_LIVE_INTERVAL_SECONDS", "2.0")),
     )
 
-    # Job state adapter for the runner protocol
-    class _JobStateAdapter:
-        """Bridges IngestJobStateRepository to JobStateRepository protocol."""
+    # Build and start worker — determine worker ID first
+    hostname = socket.gethostname() or "worker"
+    default_consumer = f"{hostname}-{os.getpid()}"
+    worker_id = os.getenv("VALKEY_STREAM_CONSUMER", default_consumer)
 
-        def get_job(self, job_id: str):
-            return job_repo.get_job(job_id=job_id)
+    # Phase 3: use QueueClientJobState to report via queue-service HTTP API.
+    # Falls back to direct DB via _JobStateAdapter for get_job() and
+    # queue_search_sync_job() which are separate concerns.
+    from nas_processor.src.worker.queue_client import QueueClient
+    from nas_processor.src.worker.runner import QueueClientJobState
 
-        def set_job(self, job_id: str, *, persist: bool = True, **changes):
-            current = job_repo.get_job(job_id=job_id) or {}
-            current["job_id"] = job_id
-            current.update(changes)
-            job_repo.save_job(job_id=job_id, state=current)
+    queue_client = QueueClient(
+        base_url=os.environ.get("QUEUE_SERVICE_URL", "http://queue-service:8005"),
+        service_key=os.environ.get("QUEUE_SERVICE_KEY", "internal-dev-key"),
+    )
 
-        def queue_search_sync_job(self, job_id: str):
+    class _SearchSyncAdapter:
+        """Provides only queue_search_sync_job() — keeps search sync in-process."""
+
+        def queue_search_sync_job(self, job_id: str) -> None:
             from nas_config.db import build_dsn
             from nas_processor.src.search.config import SearchConfig
             from nas_processor.src.search.sync import sync_job_to_search
@@ -310,22 +337,25 @@ def main() -> None:
                 result.get("skipped", 0),
             )
 
+    job_state = QueueClientJobState(
+        queue_client=queue_client,
+        worker_id=worker_id,
+        fallback_repo=_SearchSyncAdapter(),
+    )
+
     runner = JobRunner(
         s3_client=s3_client,
-        job_state=_JobStateAdapter(),
+        job_state=job_state,
         config=runner_config,
     )
 
-    # Build and start worker
-    hostname = socket.gethostname() or "worker"
-    default_consumer = f"{hostname}-{os.getpid()}"
     worker = IngestWorker(
         job_runner=runner,
         job_repo=job_repo,
         valkey_url=os.getenv("VALKEY_URL", "redis://valkey:6379/0"),
         valkey_stream_key=os.getenv("VALKEY_STREAM_KEY", "bulk_ingest_events"),
         valkey_stream_group=os.getenv("VALKEY_STREAM_GROUP", "bulk_ingest_workers"),
-        valkey_stream_consumer=os.getenv("VALKEY_STREAM_CONSUMER", default_consumer),
+        valkey_stream_consumer=worker_id,
         valkey_stream_block_ms=int(os.getenv("VALKEY_STREAM_BLOCK_MS", "5000")),
         valkey_stream_claim_idle_ms=int(os.getenv("VALKEY_STREAM_CLAIM_IDLE_MS", "60000")),
         valkey_stream_claim_count=int(os.getenv("VALKEY_STREAM_CLAIM_COUNT", "10")),

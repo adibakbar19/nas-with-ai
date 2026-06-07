@@ -197,9 +197,10 @@ def map_pipeline_to_standardized(df: pl.DataFrame) -> pl.DataFrame:
                 null_cols.append(pl.lit(None).cast(pl.Utf8).alias(col))
         df = df.with_columns(null_cols)
 
-    # 4. Cast confidence_score to Float64 if it's Int32
-    if "confidence_score" in df.columns and df.schema["confidence_score"] != pl.Float64:
-        df = df.with_columns(pl.col("confidence_score").cast(pl.Float64))
+    # 4. Cast numeric columns to correct types
+    for _col in ("latitude", "longitude", "confidence_score"):
+        if _col in df.columns and df.schema[_col] not in (pl.Float64, pl.Float32, pl.Null):
+            df = df.with_columns(pl.col(_col).cast(pl.Float64, strict=False).alias(_col))
 
     # 5. Drop extra columns and reorder
     extra = set(df.columns) - expected
@@ -452,6 +453,28 @@ def load_chunk(
             except Exception as exc:
                 logger.warning("staging_table_drop_failed table=%s error=%s", staging_qualified, exc)
 
+    # 5b. PostGIS: populate geom from lat/lon for rows that now have coordinates
+    try:
+        record_ids = mapped_df["record_id"].to_list()
+        with engine.begin() as conn:
+            result = conn.execute(
+                sa.text(f"""
+                    UPDATE {_qualified(schema, table)}
+                    SET geom      = ST_SetSRID(ST_MakePoint(longitude, latitude), 4326),
+                        updated_at = NOW()
+                    WHERE record_id = ANY(:ids)
+                      AND latitude  IS NOT NULL
+                      AND longitude IS NOT NULL
+                      AND geom IS NULL
+                """),
+                {"ids": record_ids},
+            )
+            geom_updated = result.rowcount
+        if geom_updated:
+            logger.info("geom_populated rows=%d", geom_updated)
+    except Exception as exc:
+        logger.warning("geom_populate_failed error=%s", exc)
+
     # 6. Insert raw_address (simple append via SQLAlchemy)
     if raw_df is not None and not raw_df.is_empty():
         try:
@@ -470,6 +493,27 @@ def load_chunk(
         "load_complete table=%s.%s rows_processed=%d batches=%d",
         schema, table, total_processed, (total_rows + batch_size - 1) // batch_size,
     )
+
+    # 7. Publish address.created events (fire-and-forget, never blocks ETL)
+    try:
+        from nas_processor.src.events.publisher import publish as _publish_event
+        for row in mapped_df.select(
+            ["record_id", "postcode", "state_code", "mukim_id", "coordinate_level"]
+        ).to_dicts():
+            _publish_event(
+                "address.created",
+                entity_id=row["record_id"],
+                entity_type="address",
+                payload={
+                    "record_id":        row["record_id"],
+                    "postcode":         row.get("postcode"),
+                    "state_code":       row.get("state_code"),
+                    "mukim_id":         row.get("mukim_id"),
+                    "coordinate_level": row.get("coordinate_level"),
+                },
+            )
+    except Exception as exc:
+        logger.warning("address_events_publish_failed error=%s", exc)
 
     return {
         "rows_processed": total_processed,

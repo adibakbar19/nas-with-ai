@@ -34,6 +34,48 @@ class JobStateRepository(Protocol):
     def queue_search_sync_job(self, job_id: str) -> None: ...
 
 
+class QueueClientJobState:
+    """Implements JobStateRepository protocol via queue-service HTTP API.
+
+    Falls back to the legacy IngestJobStateRepository for get_job() if
+    queue-service returns None, and for queue_search_sync_job() which is
+    a search concern unrelated to job queuing.
+    """
+
+    def __init__(
+        self,
+        queue_client,  # QueueClient
+        worker_id: str,
+        fallback_repo=None,  # IngestJobStateRepository | None
+    ) -> None:
+        self._qc = queue_client
+        self._worker_id = worker_id
+        self._fallback = fallback_repo
+
+    def get_job(self, job_id: str) -> dict[str, Any] | None:
+        job = self._qc.get_job(job_id)
+        if job is not None:
+            return job
+        if self._fallback:
+            return self._fallback.get_job(job_id=job_id)
+        return None
+
+    def set_job(self, job_id: str, *, persist: bool = True, **changes: Any) -> None:
+        """Route set_job calls to queue-service update_progress.
+
+        The `persist` flag is kept for API compatibility but ignored — every
+        call goes to queue-service (which decides what to persist).
+        Also writes a heartbeat so long ETL runs don't expire.
+        """
+        self._qc.update_progress(job_id, self._worker_id, **changes)
+
+    def queue_search_sync_job(self, job_id: str) -> None:
+        if self._fallback and hasattr(self._fallback, "queue_search_sync_job"):
+            self._fallback.queue_search_sync_job(job_id)
+        else:
+            logger.debug("queue_search_sync_job skipped job_id=%s (no fallback)", job_id)
+
+
 class S3Client(Protocol):
     """Protocol for S3 operations."""
 
@@ -101,6 +143,9 @@ class DbProgressCallback:
         **extra: object,
     ) -> None:
         self._write(last_log_line=f"{stage} done: {rows_processed} rows, {rows_failed} failed")
+        # Heartbeat via queue-service so long ETL stages don't expire the job
+        if hasattr(self._jobs, "_qc"):
+            self._jobs._qc.heartbeat(self._job_id, self._jobs._worker_id)
 
     def on_checkpoint_skip(self, stage: str, path: str, row_count: int) -> None:
         self._write(last_log_line=f"resuming {stage} ({row_count} rows)")
@@ -201,7 +246,7 @@ class JobRunner:
         else:
             self._run_bulk_ingest(job_id, job)
 
-    def _run_bulk_ingest(self, job_id: str, job: dict[str, Any]) -> None:
+    def _run_bulk_ingest(self, job_id: str, job: dict[str, Any]) -> None:  # noqa: C901
         cfg = self._config
         cfg.log_dir.mkdir(parents=True, exist_ok=True)
         cfg.upload_staging_dir.mkdir(parents=True, exist_ok=True)
@@ -271,21 +316,59 @@ class JobRunner:
                 return
 
             output_prefix = self._upload_output(job_id, job, success_path, warning_path, failed_path, log_path)
-            self._jobs.set_job(
-                job_id, status="completed", ended_at=_now_iso(),
-                success_path=str(success_path), warning_path=str(warning_path),
-                failed_path=str(failed_path), checkpoint_root=str(checkpoint_root),
-                log_path=str(log_path), output_object_prefix=output_prefix,
-                progress_pct=100, progress_stage="completed", load_status="completed",
-            )
+            result_data = {
+                "status": "completed", "ended_at": _now_iso(),
+                "success_path": str(success_path), "warning_path": str(warning_path),
+                "failed_path": str(failed_path), "checkpoint_root": str(checkpoint_root),
+                "log_path": str(log_path), "output_object_prefix": output_prefix,
+                "progress_pct": 100, "progress_stage": "completed",
+                "load_status": "completed",
+            }
+            worker_id = getattr(self._jobs, "_worker_id", "worker")
+            if hasattr(self._jobs, "_qc"):
+                self._jobs._qc.complete_job(job_id, worker_id, result_data)
+            else:
+                self._jobs.set_job(job_id, **result_data)
+            try:
+                from nas_processor.src.events.publisher import publish as _publish_event
+                _publish_event(
+                    "job.completed",
+                    entity_id=job_id,
+                    entity_type="job",
+                    payload={
+                        "job_id": job_id,
+                        "agency_id": str(job.get("agency_id") or ""),
+                        "file_name": str(job.get("file_name") or ""),
+                    },
+                )
+            except Exception:
+                pass
 
         except Exception as exc:
-            self._jobs.set_job(
-                job_id, status="failed", ended_at=_now_iso(),
-                error=f"pipeline error: {exc}",
-                log_path=str(log_path), progress_pct=100,
-                progress_stage="failed", load_status="failed",
-            )
+            worker_id = getattr(self._jobs, "_worker_id", "worker")
+            if hasattr(self._jobs, "_qc"):
+                self._jobs._qc.fail_job(job_id, worker_id, f"pipeline error: {exc}")
+            else:
+                self._jobs.set_job(
+                    job_id, status="failed", ended_at=_now_iso(),
+                    error=f"pipeline error: {exc}",
+                    log_path=str(log_path), progress_pct=100,
+                    progress_stage="failed", load_status="failed",
+                )
+            try:
+                from nas_processor.src.events.publisher import publish as _publish_event
+                _publish_event(
+                    "job.failed",
+                    entity_id=job_id,
+                    entity_type="job",
+                    payload={
+                        "job_id": job_id,
+                        "agency_id": str(job.get("agency_id") or ""),
+                        "error": f"pipeline error: {exc}",
+                    },
+                )
+            except Exception:
+                pass
             with log_path.open("a", encoding="utf-8") as f:
                 f.write(f"[{_now_iso()}] pipeline error job={job_id}: {exc}\n")
                 f.write(traceback.format_exc() + "\n")
