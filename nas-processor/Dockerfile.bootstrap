@@ -21,6 +21,6 @@ COPY config/ ./config/
 COPY data/ ./data/
 
 # Copy bootstrap script
-COPY bootstrap_lookups_if_needed.py ./
+COPY nas-processor/scripts/bootstrap_lookups_if_needed.py ./
 
 CMD ["python", "bootstrap_lookups_if_needed.py"]
